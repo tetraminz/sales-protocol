@@ -248,6 +248,101 @@ func TestEmpathyConfidence_DefaultPendingReview(t *testing.T) {
 	}
 }
 
+func TestAnnotate_UsesSGRQualityDecisionForFarewellContext(t *testing.T) {
+	tmp := t.TempDir()
+	csvDir := filepath.Join(tmp, "csv")
+	dbPath := filepath.Join(tmp, "annotations.db")
+	mock := newFarewellOverrideMockServer(t)
+	defer mock.Close()
+
+	if err := os.MkdirAll(csvDir, 0o755); err != nil {
+		t.Fatalf("mkdir csv dir: %v", err)
+	}
+	csvBody := strings.Join([]string{
+		"Conversation,Chunk_id,Speaker,Text,Embedding",
+		fmt.Sprintf("conv_farewell,1,%s,\"Thanks, bye.\",[]", speakerCustomer),
+		fmt.Sprintf("conv_farewell,2,%s,\"Goodbye!\",[]", speakerSalesRep),
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(csvDir, "a.csv"), []byte(csvBody), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+
+	if err := AnnotateToSQLite(context.Background(), AnnotateConfig{
+		DBPath:   dbPath,
+		InputDir: csvDir,
+		FromIdx:  1,
+		ToIdx:    1,
+		Model:    defaultAnnotateModel,
+		APIKey:   "test_key",
+		BaseURL:  mock.URL,
+	}); err != nil {
+		t.Fatalf("annotate: %v", err)
+	}
+
+	db, err := openSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	var speakerTrue string
+	var speakerPredicted string
+	var speakerMatch int
+	if err := db.QueryRow(`
+		SELECT speaker_true, speaker_predicted, speaker_match
+		FROM annotations
+		WHERE conversation_id = 'conv_farewell' AND replica_id = 2
+	`).Scan(&speakerTrue, &speakerPredicted, &speakerMatch); err != nil {
+		t.Fatalf("query farewell annotation: %v", err)
+	}
+	if speakerTrue != speakerSalesRep {
+		t.Fatalf("speaker_true=%q want=%q", speakerTrue, speakerSalesRep)
+	}
+	if speakerPredicted != speakerCustomer {
+		t.Fatalf("speaker_predicted=%q want=%q", speakerPredicted, speakerCustomer)
+	}
+	if speakerMatch != 1 {
+		t.Fatalf("speaker_match=%d want=1 because SGR override should clear farewell mismatch", speakerMatch)
+	}
+
+	var sgrMessage string
+	var sgrRawJSON string
+	if err := db.QueryRow(`
+		SELECT message, raw_json
+		FROM annotate_logs
+		WHERE conversation_id = 'conv_farewell' AND replica_id = 2 AND stage = 'sgr'
+		ORDER BY id DESC LIMIT 1
+	`).Scan(&sgrMessage, &sgrRawJSON); err != nil {
+		t.Fatalf("query sgr log row: %v", err)
+	}
+	if !strings.Contains(sgrMessage, "decision="+qualityDecisionFarewellOverride) {
+		t.Fatalf("sgr message=%q must contain farewell override decision", sgrMessage)
+	}
+	if !strings.Contains(sgrMessage, "raw_match=0") {
+		t.Fatalf("sgr message=%q must contain raw_match=0", sgrMessage)
+	}
+	if !strings.Contains(sgrMessage, "final_match=1") {
+		t.Fatalf("sgr message=%q must contain final_match=1", sgrMessage)
+	}
+
+	var sgrPayload map[string]any
+	if err := json.Unmarshal([]byte(sgrRawJSON), &sgrPayload); err != nil {
+		t.Fatalf("unmarshal sgr raw_json: %v raw=%s", err, sgrRawJSON)
+	}
+	if sgrPayload["quality_decision"] != qualityDecisionFarewellOverride {
+		t.Fatalf("quality_decision=%v want=%q", sgrPayload["quality_decision"], qualityDecisionFarewellOverride)
+	}
+	if sgrPayload["farewell_context"] != true {
+		t.Fatalf("farewell_context=%v want=true", sgrPayload["farewell_context"])
+	}
+	if sgrPayload["raw_match"] != float64(0) {
+		t.Fatalf("raw_match=%v want=0", sgrPayload["raw_match"])
+	}
+	if sgrPayload["final_match"] != float64(1) {
+		t.Fatalf("final_match=%v want=1", sgrPayload["final_match"])
+	}
+}
+
 func TestAnnotate_WritesLLMResponseAndErrorLogs(t *testing.T) {
 	tmp := t.TempDir()
 	csvDir := filepath.Join(tmp, "csv")
@@ -495,10 +590,19 @@ func newStructuredMockServer(t *testing.T) *httptest.Server {
 			if strings.Contains(strings.ToLower(currentText), "customer") {
 				predicted = speakerCustomer
 			}
+			lowerCurrent := strings.ToLower(currentText)
+			isFarewell := strings.Contains(lowerCurrent, "bye") || strings.Contains(lowerCurrent, "goodbye")
+			contextSource := farewellContextSourceNone
+			if isFarewell {
+				contextSource = farewellContextSourceCurrent
+			}
 			quote := firstQuoteToken(currentText)
 			content = mustJSONString(t, map[string]any{
-				"predicted_speaker": predicted,
-				"confidence":        0.91,
+				"predicted_speaker":     predicted,
+				"confidence":            0.91,
+				"is_farewell_utterance": isFarewell,
+				"is_farewell_context":   isFarewell,
+				"context_source":        contextSource,
 				"evidence": map[string]any{
 					"quote": quote,
 				},
@@ -536,12 +640,102 @@ func newInvalidQuoteMockServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		content := mustJSONString(t, map[string]any{
-			"predicted_speaker": speakerSalesRep,
-			"confidence":        0.9,
+			"predicted_speaker":     speakerSalesRep,
+			"confidence":            0.9,
+			"is_farewell_utterance": false,
+			"is_farewell_context":   false,
+			"context_source":        farewellContextSourceNone,
 			"evidence": map[string]any{
 				"quote": "this_quote_is_missing",
 			},
 		})
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"content": content,
+						"refusal": "",
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	})
+	return httptest.NewServer(handler)
+}
+
+func newFarewellOverrideMockServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	currentTextExpr := regexp.MustCompile(`current: "(.*?)"`)
+
+	type requestMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type requestBody struct {
+		Messages       []requestMessage `json:"messages"`
+		ResponseFormat struct {
+			JSONSchema struct {
+				Name string `json:"name"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req requestBody
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+
+		currentText := ""
+		for _, m := range req.Messages {
+			if m.Role != "user" {
+				continue
+			}
+			match := currentTextExpr.FindStringSubmatch(m.Content)
+			if len(match) > 1 {
+				currentText = match[1]
+				break
+			}
+		}
+
+		content := "{}"
+		switch req.ResponseFormat.JSONSchema.Name {
+		case "speaker_case_v1":
+			lowerCurrent := strings.ToLower(currentText)
+			isFarewell := strings.Contains(lowerCurrent, "bye") || strings.Contains(lowerCurrent, "goodbye")
+			contextSource := farewellContextSourceNone
+			if isFarewell {
+				contextSource = farewellContextSourceCurrent
+			}
+			predicted := speakerSalesRep
+			if isFarewell {
+				// Специально эмулируем raw mismatch на прощании, чтобы проверить SGR-override.
+				predicted = speakerCustomer
+			}
+			content = mustJSONString(t, map[string]any{
+				"predicted_speaker":     predicted,
+				"confidence":            0.89,
+				"is_farewell_utterance": isFarewell,
+				"is_farewell_context":   isFarewell,
+				"context_source":        contextSource,
+				"evidence": map[string]any{
+					"quote": firstQuoteToken(currentText),
+				},
+			})
+		case "empathy_confidence_v1":
+			content = mustJSONString(t, map[string]any{
+				"confidence": 0.77,
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected schema"}`))
+			return
+		}
+
 		resp := map[string]any{
 			"choices": []map[string]any{
 				{

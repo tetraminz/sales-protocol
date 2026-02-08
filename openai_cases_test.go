@@ -12,8 +12,11 @@ import (
 func TestSpeakerCase_LLMOnly(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		content := mustJSONString(t, map[string]any{
-			"predicted_speaker": speakerCustomer,
-			"confidence":        0.31,
+			"predicted_speaker":     speakerCustomer,
+			"confidence":            0.31,
+			"is_farewell_utterance": false,
+			"is_farewell_context":   false,
+			"context_source":        "none",
 			"evidence": map[string]any{
 				"quote": "Thanks",
 			},
@@ -132,6 +135,71 @@ func TestEmpathyCase_SkipsCustomerReplica(t *testing.T) {
 	}
 	if empathyCase.calls != 0 {
 		t.Fatalf("empathy case calls=%d want 0", empathyCase.calls)
+	}
+}
+
+func TestBusinessProcess_FarewellContextOverridesMismatch(t *testing.T) {
+	empathyCase := &countingEmpathyCase{}
+	process := AnnotationBusinessProcess{
+		SpeakerCase: staticSpeakerCase{out: ReplicaCaseResult{
+			PredictedSpeaker:      speakerCustomer,
+			Confidence:            0.93,
+			EvidenceQuote:         "Goodbye!",
+			FarewellUtterance:     true,
+			FarewellContext:       true,
+			FarewellContextSource: farewellContextSourceCurrent,
+		}},
+		EmpathyCase: empathyCase,
+	}
+
+	out, err := process.Run(context.Background(), ProcessInput{
+		ReplicaText: "Goodbye!",
+		PrevText:    "Thanks, bye.",
+		NextText:    "",
+		SpeakerTrue: speakerSalesRep,
+	})
+	if err != nil {
+		t.Fatalf("run process: %v", err)
+	}
+	if out.Speaker.PredictedSpeaker != speakerCustomer {
+		t.Fatalf("predicted speaker=%q want=%q", out.Speaker.PredictedSpeaker, speakerCustomer)
+	}
+	if out.Speaker.QualityMismatch {
+		t.Fatalf("quality mismatch must be overridden for farewell context")
+	}
+	if out.Speaker.QualityDecision != qualityDecisionFarewellOverride {
+		t.Fatalf("quality decision=%q want=%q", out.Speaker.QualityDecision, qualityDecisionFarewellOverride)
+	}
+}
+
+func TestBusinessProcess_StrictMismatchWithoutFarewellContext(t *testing.T) {
+	empathyCase := &countingEmpathyCase{}
+	process := AnnotationBusinessProcess{
+		SpeakerCase: staticSpeakerCase{out: ReplicaCaseResult{
+			PredictedSpeaker:      speakerCustomer,
+			Confidence:            0.91,
+			EvidenceQuote:         "Hello",
+			FarewellUtterance:     false,
+			FarewellContext:       false,
+			FarewellContextSource: farewellContextSourceNone,
+		}},
+		EmpathyCase: empathyCase,
+	}
+
+	out, err := process.Run(context.Background(), ProcessInput{
+		ReplicaText: "Hello Sarah, thanks for taking my call.",
+		PrevText:    "",
+		NextText:    "Hi Mark.",
+		SpeakerTrue: speakerSalesRep,
+	})
+	if err != nil {
+		t.Fatalf("run process: %v", err)
+	}
+	if !out.Speaker.QualityMismatch {
+		t.Fatalf("quality mismatch should stay strict when farewell context is false")
+	}
+	if out.Speaker.QualityDecision != qualityDecisionStrictMismatch {
+		t.Fatalf("quality decision=%q want=%q", out.Speaker.QualityDecision, qualityDecisionStrictMismatch)
 	}
 }
 

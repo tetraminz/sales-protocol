@@ -21,6 +21,14 @@ const shortUtteranceMaxLen = 40
 const maxLogRawJSONLen = 500
 const maxLogMessageLen = 300
 
+const (
+	farewellContextSourceNone     = "none"
+	farewellContextSourceCurrent  = "current"
+	farewellContextSourcePrevious = "previous"
+	farewellContextSourceNext     = "next"
+	farewellContextSourceMixed    = "mixed"
+)
+
 type AnnotateConfig struct {
 	DBPath   string
 	InputDir string
@@ -57,9 +65,12 @@ type openAIMessage struct {
 }
 
 type speakerLLMOutput struct {
-	PredictedSpeaker string  `json:"predicted_speaker"`
-	Confidence       float64 `json:"confidence"`
-	Evidence         struct {
+	PredictedSpeaker    string  `json:"predicted_speaker"`
+	Confidence          float64 `json:"confidence"`
+	IsFarewellUtterance bool    `json:"is_farewell_utterance"`
+	IsFarewellContext   bool    `json:"is_farewell_context"`
+	ContextSource       string  `json:"context_source"`
+	Evidence            struct {
 		Quote string `json:"quote"`
 	} `json:"evidence"`
 }
@@ -85,9 +96,14 @@ type openAIEmpathyCase struct {
 }
 
 var fallbackSpeakerResult = ReplicaCaseResult{
-	PredictedSpeaker: speakerCustomer,
-	Confidence:       0,
-	EvidenceQuote:    "",
+	PredictedSpeaker:      speakerCustomer,
+	Confidence:            0,
+	EvidenceQuote:         "",
+	FarewellUtterance:     false,
+	FarewellContext:       false,
+	FarewellContextSource: farewellContextSourceNone,
+	QualityMismatch:       true,
+	QualityDecision:       qualityDecisionStrictMismatch,
 }
 
 var fallbackEmpathyResult = EmpathyCaseResult{
@@ -253,12 +269,54 @@ func AnnotateToSQLite(ctx context.Context, cfg AnnotateConfig) error {
 
 			speakerTrue := canonicalSpeakerLabel(replica.SpeakerTrue)
 			speakerPredicted := canonicalSpeakerLabel(out.Speaker.PredictedSpeaker)
-			speakerMatch := boolToInt(speakerTrue == speakerPredicted)
+			rawSpeakerMatch := speakerTrue == speakerPredicted
+			if strings.TrimSpace(out.Speaker.QualityDecision) == "" {
+				// Защита на деградацию: если бизнес-решение не было заполнено,
+				// восстанавливаем строгую ветку по истинной/предсказанной метке.
+				out.Speaker.QualityMismatch, out.Speaker.QualityDecision = decideSpeakerQuality(
+					speakerTrue,
+					speakerPredicted,
+					false,
+				)
+			}
+			out.Speaker.FarewellContextSource = normalizeFarewellContextSource(out.Speaker.FarewellContextSource)
+			speakerMatch := boolToInt(!out.Speaker.QualityMismatch)
 			speakerConfidence := clamp01(out.Speaker.Confidence)
 			empathyConfidence := 0.0
 			if speakerTrue == speakerSalesRep {
 				empathyConfidence = clamp01(out.Empathy.Confidence)
 			}
+			sgrPayload := map[string]any{
+				"conversation_id":      replica.ConversationID,
+				"replica_id":           replica.ReplicaID,
+				"quality_decision":     out.Speaker.QualityDecision,
+				"farewell_context":     out.Speaker.FarewellContext,
+				"farewell_utterance":   out.Speaker.FarewellUtterance,
+				"context_source":       out.Speaker.FarewellContextSource,
+				"raw_match":            boolToInt(rawSpeakerMatch),
+				"final_match":          speakerMatch,
+				"speaker_true":         speakerTrue,
+				"speaker_predicted":    speakerPredicted,
+				"speaker_quality_miss": boolToInt(out.Speaker.QualityMismatch),
+			}
+			sgrRawJSON := "{}"
+			if payload, err := json.Marshal(sgrPayload); err == nil {
+				sgrRawJSON = string(payload)
+			}
+			logger.write(
+				replica.ConversationID,
+				replica.ReplicaID,
+				"sgr",
+				"info",
+				fmt.Sprintf(
+					"decision=%s raw_match=%d final_match=%d",
+					out.Speaker.QualityDecision,
+					boolToInt(rawSpeakerMatch),
+					speakerMatch,
+				),
+				sgrRawJSON,
+				cfg.Model,
+			)
 
 			if _, err := stmt.Exec(
 				replica.ConversationID,
@@ -496,6 +554,21 @@ func canonicalSpeakerLabel(raw string) string {
 	return s
 }
 
+func normalizeFarewellContextSource(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case farewellContextSourceCurrent:
+		return farewellContextSourceCurrent
+	case farewellContextSourcePrevious:
+		return farewellContextSourcePrevious
+	case farewellContextSourceNext:
+		return farewellContextSourceNext
+	case farewellContextSourceMixed:
+		return farewellContextSourceMixed
+	default:
+		return farewellContextSourceNone
+	}
+}
+
 func (c *openAISpeakerCase) setLogContext(conversationID string, replicaID int) {
 	c.conversationID = conversationID
 	c.replicaID = replicaID
@@ -544,13 +617,25 @@ func (c *openAISpeakerCase) Evaluate(ctx context.Context, in ReplicaCaseInput) (
 		c.log("error", fmt.Sprintf("invalid_speaker value=%q", pred), content)
 		return fallbackSpeakerResult, nil
 	}
+	contextSource := normalizeFarewellContextSource(out.ContextSource)
+	farewellContext := out.IsFarewellContext
+	if !farewellContext {
+		contextSource = farewellContextSourceNone
+	}
+	if farewellContext && contextSource == farewellContextSourceNone {
+		c.log("error", fmt.Sprintf("invalid_context_source value=%q", out.ContextSource), content)
+		farewellContext = false
+	}
 	quote := strings.TrimSpace(out.Evidence.Quote)
 	if quote == "" {
 		c.log("error", "quote_empty", content)
 		return ReplicaCaseResult{
-			PredictedSpeaker: pred,
-			Confidence:       clamp01(out.Confidence),
-			EvidenceQuote:    "",
+			PredictedSpeaker:      pred,
+			Confidence:            clamp01(out.Confidence),
+			EvidenceQuote:         "",
+			FarewellUtterance:     out.IsFarewellUtterance,
+			FarewellContext:       farewellContext,
+			FarewellContextSource: contextSource,
 		}, nil
 	}
 	if !strings.Contains(in.ReplicaText, quote) {
@@ -564,16 +649,22 @@ func (c *openAISpeakerCase) Evaluate(ctx context.Context, in ReplicaCaseInput) (
 			content,
 		)
 		return ReplicaCaseResult{
-			PredictedSpeaker: pred,
-			Confidence:       clamp01(out.Confidence),
-			EvidenceQuote:    "",
+			PredictedSpeaker:      pred,
+			Confidence:            clamp01(out.Confidence),
+			EvidenceQuote:         "",
+			FarewellUtterance:     out.IsFarewellUtterance,
+			FarewellContext:       farewellContext,
+			FarewellContextSource: contextSource,
 		}, nil
 	}
 
 	return ReplicaCaseResult{
-		PredictedSpeaker: pred,
-		Confidence:       clamp01(out.Confidence),
-		EvidenceQuote:    quote,
+		PredictedSpeaker:      pred,
+		Confidence:            clamp01(out.Confidence),
+		EvidenceQuote:         quote,
+		FarewellUtterance:     out.IsFarewellUtterance,
+		FarewellContext:       farewellContext,
+		FarewellContextSource: contextSource,
 	}, nil
 }
 
@@ -614,9 +705,9 @@ func fallbackProcessOutput() ProcessOutput {
 }
 
 func speakerMessages(prevText, replicaText, nextText string) []openAIMessage {
-	system := "Return JSON only. Follow schema strictly. evidence.quote must be exact substring of current. If current is short or ambiguous (bye/thanks), use previous and next context."
+	system := "Return JSON only. Follow schema strictly. Step 1: detect farewell signals from previous/current/next. Step 2: classify who wrote current. context_source must be one of current, previous, next, mixed, none. evidence.quote must be exact substring of current."
 	user := fmt.Sprintf(
-		"previous: %q\ncurrent: %q\nnext: %q\nTask: who wrote current? Return Sales Rep or Customer.",
+		"previous: %q\ncurrent: %q\nnext: %q\nTask:\n1) fill is_farewell_utterance, is_farewell_context, context_source.\n2) predict speaker for current as Sales Rep or Customer.\nRules for farewell_context: true if current/neighbor turns are part of a closing exchange (bye, goodbye, thanks+good day, final sign-off).",
 		prevText,
 		replicaText,
 		nextText,
@@ -640,10 +731,28 @@ func speakerSchema() map[string]any {
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
-		"required":             []string{"predicted_speaker", "confidence", "evidence"},
+		"required": []string{
+			"predicted_speaker",
+			"confidence",
+			"is_farewell_utterance",
+			"is_farewell_context",
+			"context_source",
+			"evidence",
+		},
 		"properties": map[string]any{
-			"predicted_speaker": map[string]any{"enum": []string{speakerSalesRep, speakerCustomer}},
-			"confidence":        map[string]any{"type": "number"},
+			"predicted_speaker":     map[string]any{"enum": []string{speakerSalesRep, speakerCustomer}},
+			"confidence":            map[string]any{"type": "number"},
+			"is_farewell_utterance": map[string]any{"type": "boolean"},
+			"is_farewell_context":   map[string]any{"type": "boolean"},
+			"context_source": map[string]any{
+				"enum": []string{
+					farewellContextSourceCurrent,
+					farewellContextSourcePrevious,
+					farewellContextSourceNext,
+					farewellContextSourceMixed,
+					farewellContextSourceNone,
+				},
+			},
 			"evidence": map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
