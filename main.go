@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -9,52 +8,68 @@ import (
 )
 
 func main() {
-	cfg := parseFlags()
-	if err := validateConfig(cfg); err != nil {
-		log.Fatalf("config error: %v", err)
+	log.SetFlags(0)
+	if err := runCLI(); err != nil {
+		log.Fatalf("error: %v", err)
 	}
-
-	ctx := context.Background()
-	if err := run(ctx, cfg); err != nil {
-		log.Fatalf("run failed: %v", err)
-	}
-
-	fmt.Printf("Done. Wrote annotations to %s\n", cfg.OutJSONL)
 }
 
-func parseFlags() Config {
-	cfg := Config{}
-	flag.StringVar(&cfg.InputDir, "input_dir", "/Users/ablackman/data/sales-transcripts/data/chunked_transcripts", "Folder with CSV files (required)")
-	flag.StringVar(&cfg.OutJSONL, "out_jsonl", "", "Output JSONL path (required)")
-	flag.IntVar(&cfg.LimitConversations, "limit_conversations", 20, "How many CSV conversations to process")
-	flag.StringVar(&cfg.Model, "model", "gpt-4.1-mini", "OpenAI model")
-	flag.IntVar(&cfg.MaxRetries, "max_retries", 2, "Retries per unit for API/validation errors")
-	flag.BoolVar(&cfg.DryRun, "dry_run", false, "Do not call OpenAI, only emit empty/default unit outputs")
-	flag.Parse()
-
-	cfg.APIKey = os.Getenv("OPENAI_API_KEY")
-	cfg.BaseURL = os.Getenv("OPENAI_BASE_URL")
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = defaultBaseURL
+func runCLI() error {
+	if len(os.Args) < 2 {
+		printUsage()
+		return nil
 	}
-	return cfg
+
+	command := os.Args[1]
+	args := os.Args[2:]
+
+	switch command {
+	case "migrate":
+		return runMigrateCmd(args)
+	case "report":
+		return runReportCmd(args)
+	case "-h", "--help", "help":
+		printUsage()
+		return nil
+	default:
+		printUsage()
+		return fmt.Errorf("unknown command: %s", command)
+	}
 }
 
-func validateConfig(cfg Config) error {
-	if cfg.InputDir == "" {
-		return fmt.Errorf("--input_dir is required")
+func runMigrateCmd(args []string) error {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	inJSONL := fs.String("in_jsonl", defaultInputJSONLPath, "Path to input annotations JSONL")
+	outDB := fs.String("out_db", defaultSQLitePath, "Path to output SQLite DB file")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	if cfg.OutJSONL == "" {
-		return fmt.Errorf("--out_jsonl is required")
+
+	inserted, err := MigrateJSONLToSQLite(*inJSONL, *outDB)
+	if err != nil {
+		return err
 	}
-	if cfg.MaxRetries < 0 {
-		return fmt.Errorf("--max_retries must be >= 0")
-	}
-	if cfg.LimitConversations < 0 {
-		return fmt.Errorf("--limit_conversations must be >= 0")
-	}
-	if !cfg.DryRun && cfg.APIKey == "" {
-		return fmt.Errorf("OPENAI_API_KEY is required unless --dry_run=true")
-	}
+	fmt.Printf("migrated_rows=%d db=%s\n", inserted, *outDB)
 	return nil
+}
+
+func runReportCmd(args []string) error {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	dbPath := fs.String("db", defaultSQLitePath, "Path to SQLite DB file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	report, err := BuildReport(*dbPath)
+	if err != nil {
+		return err
+	}
+	PrintReport(report)
+	return nil
+}
+
+func printUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  go run . migrate --in_jsonl out/annotations.jsonl --out_db out/annotations.db")
+	fmt.Println("  go run . report --db out/annotations.db")
 }
