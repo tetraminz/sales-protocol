@@ -12,105 +12,170 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
-	"time"
 )
 
-func TestSetupSQLite_HardResetCreatesMinimalSchema(t *testing.T) {
+type mockRequestMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+func TestSetupSQLite_CreatesNewSchema(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "annotations.db")
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS annotation_runs (run_id TEXT PRIMARY KEY)`); err != nil {
-		t.Fatalf("create old annotation_runs table: %v", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS annotations (legacy_col TEXT)`); err != nil {
-		t.Fatalf("create old annotations table: %v", err)
-	}
-
 	if err := SetupSQLite(dbPath); err != nil {
 		t.Fatalf("setup sqlite: %v", err)
 	}
 
-	db, err = openSQLite(dbPath)
+	db, err := openSQLite(dbPath)
 	if err != nil {
-		t.Fatalf("open sqlite after setup: %v", err)
+		t.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
 
-	if tableExists(t, db, "annotation_runs") {
-		t.Fatalf("annotation_runs table should be removed")
-	}
 	if !tableExists(t, db, "annotations") {
 		t.Fatalf("annotations table should exist")
 	}
+	if !tableExists(t, db, "llm_events") {
+		t.Fatalf("llm_events table should exist")
+	}
 
-	cols := annotationColumns(t, db)
-	want := []string{
+	annotationCols := tableColumns(t, db, "annotations")
+	wantAnnotationCols := requiredAnnotationColumns()
+	sort.Strings(wantAnnotationCols)
+	if strings.Join(annotationCols, ",") != strings.Join(wantAnnotationCols, ",") {
+		t.Fatalf("annotations columns=%v want=%v", annotationCols, wantAnnotationCols)
+	}
+
+	eventCols := tableColumns(t, db, "llm_events")
+	wantEventCols := requiredLLMEventColumns()
+	sort.Strings(wantEventCols)
+	if strings.Join(eventCols, ",") != strings.Join(wantEventCols, ",") {
+		t.Fatalf("llm_events columns=%v want=%v", eventCols, wantEventCols)
+	}
+}
+
+func TestAnnotate_WritesAnnotationsAndLLMEvents(t *testing.T) {
+	tmp := t.TempDir()
+	csvDir := filepath.Join(tmp, "csv")
+	dbPath := filepath.Join(tmp, "annotations.db")
+	mock := newStructuredMockServer(t)
+	defer mock.Close()
+
+	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_a", speakerSalesRep, speakerCustomer)
+
+	err := AnnotateToSQLite(context.Background(), AnnotateConfig{
+		DBPath:   dbPath,
+		InputDir: csvDir,
+		FromIdx:  1,
+		ToIdx:    1,
+		Model:    defaultAnnotateModel,
+		APIKey:   "test_key",
+		BaseURL:  mock.URL,
+	})
+	if err != nil {
+		t.Fatalf("annotate: %v", err)
+	}
+
+	db, err := openSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	var annotationRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM annotations`).Scan(&annotationRows); err != nil {
+		t.Fatalf("count annotations: %v", err)
+	}
+	if annotationRows == 0 {
+		t.Fatalf("annotations should not be empty")
+	}
+
+	var llmEventRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM llm_events`).Scan(&llmEventRows); err != nil {
+		t.Fatalf("count llm_events: %v", err)
+	}
+	if llmEventRows == 0 {
+		t.Fatalf("llm_events should not be empty")
+	}
+}
+
+func TestAnnotate_LLMRequestContainsOnlyTextContext(t *testing.T) {
+	tmp := t.TempDir()
+	csvDir := filepath.Join(tmp, "csv")
+	dbPath := filepath.Join(tmp, "annotations.db")
+	mock := newStructuredMockServer(t)
+	defer mock.Close()
+
+	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_text_only", speakerSalesRep, speakerCustomer)
+
+	if err := AnnotateToSQLite(context.Background(), AnnotateConfig{
+		DBPath:   dbPath,
+		InputDir: csvDir,
+		FromIdx:  1,
+		ToIdx:    1,
+		Model:    defaultAnnotateModel,
+		APIKey:   "test_key",
+		BaseURL:  mock.URL,
+	}); err != nil {
+		t.Fatalf("annotate: %v", err)
+	}
+
+	db, err := openSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	var requestJSON string
+	if err := db.QueryRow(`
+		SELECT request_json
+		FROM llm_events
+		WHERE conversation_id='conv_text_only' AND unit_name='speaker'
+		ORDER BY id ASC LIMIT 1
+	`).Scan(&requestJSON); err != nil {
+		t.Fatalf("query speaker request_json: %v", err)
+	}
+
+	for _, forbidden := range []string{
 		"conversation_id",
-		"replica_id",
-		"speaker_true",
-		"speaker_predicted",
-		"speaker_confidence",
-		"speaker_match",
-		"empathy_confidence",
+		"utterance_index",
+		"ground_truth_speaker",
 		"empathy_review_status",
-		"empathy_reviewer_note",
-		"replica_text",
-		"model",
-		"annotated_at_utc",
-	}
-	if strings.Join(cols, ",") != strings.Join(want, ",") {
-		t.Fatalf("columns=%v want=%v", cols, want)
+	} {
+		if strings.Contains(requestJSON, forbidden) {
+			t.Fatalf("request_json unexpectedly contains %q: %s", forbidden, requestJSON)
+		}
 	}
 }
 
-func TestSetupSQLite_CreatesAnnotateLogsTable(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "annotations.db")
-	if err := SetupSQLite(dbPath); err != nil {
-		t.Fatalf("setup sqlite: %v", err)
-	}
-
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-
-	if !tableExists(t, db, "annotate_logs") {
-		t.Fatalf("annotate_logs table should exist")
-	}
-	if !indexExists(t, db, "idx_annotate_logs_conversation_replica") {
-		t.Fatalf("idx_annotate_logs_conversation_replica should exist")
-	}
-	if !indexExists(t, db, "idx_annotate_logs_status") {
-		t.Fatalf("idx_annotate_logs_status should exist")
-	}
-}
-
-func TestAnnotate_RespectsFromToInclusive(t *testing.T) {
+func TestAnnotate_SpeakerRetryCycleOnInvalidEvidence(t *testing.T) {
 	tmp := t.TempDir()
 	csvDir := filepath.Join(tmp, "csv")
 	dbPath := filepath.Join(tmp, "annotations.db")
-	mock := newStructuredMockServer(t)
+	mock := newRetrySpeakerMockServer(t)
 	defer mock.Close()
 
-	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_a", speakerSalesRep, speakerCustomer)
-	mustWriteDialogCSV(t, csvDir, "b.csv", "conv_b", speakerSalesRep, speakerCustomer)
-	mustWriteDialogCSV(t, csvDir, "c.csv", "conv_c", speakerSalesRep, speakerCustomer)
+	if err := os.MkdirAll(csvDir, 0o755); err != nil {
+		t.Fatalf("mkdir csv dir: %v", err)
+	}
+	csvBody := strings.Join([]string{
+		"Conversation,Chunk_id,Speaker,Text,Embedding",
+		fmt.Sprintf("conv_retry,1,%s,\"Hello from sales\",[]", speakerSalesRep),
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(csvDir, "a.csv"), []byte(csvBody), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
 
-	err := AnnotateToSQLite(context.Background(), AnnotateConfig{
+	if err := AnnotateToSQLite(context.Background(), AnnotateConfig{
 		DBPath:   dbPath,
 		InputDir: csvDir,
-		FromIdx:  2,
-		ToIdx:    3,
+		FromIdx:  1,
+		ToIdx:    1,
 		Model:    defaultAnnotateModel,
 		APIKey:   "test_key",
 		BaseURL:  mock.URL,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("annotate: %v", err)
 	}
 
@@ -120,135 +185,32 @@ func TestAnnotate_RespectsFromToInclusive(t *testing.T) {
 	}
 	defer db.Close()
 
-	got := distinctConversationIDs(t, db)
-	want := []string{"conv_b", "conv_c"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("conversation ids=%v want=%v", got, want)
-	}
-}
-
-func TestAnnotate_ReplacesPreviousRows(t *testing.T) {
-	tmp := t.TempDir()
-	csvDir := filepath.Join(tmp, "csv")
-	dbPath := filepath.Join(tmp, "annotations.db")
-	mock := newStructuredMockServer(t)
-	defer mock.Close()
-
-	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_a", speakerSalesRep, speakerCustomer)
-	mustWriteDialogCSV(t, csvDir, "b.csv", "conv_b", speakerSalesRep, speakerCustomer)
-
-	err := AnnotateToSQLite(context.Background(), AnnotateConfig{
-		DBPath:   dbPath,
-		InputDir: csvDir,
-		FromIdx:  1,
-		ToIdx:    1,
-		Model:    defaultAnnotateModel,
-		APIKey:   "test_key",
-		BaseURL:  mock.URL,
-	})
-	if err != nil {
-		t.Fatalf("first annotate: %v", err)
-	}
-
-	err = AnnotateToSQLite(context.Background(), AnnotateConfig{
-		DBPath:   dbPath,
-		InputDir: csvDir,
-		FromIdx:  2,
-		ToIdx:    2,
-		Model:    defaultAnnotateModel,
-		APIKey:   "test_key",
-		BaseURL:  mock.URL,
-	})
-	if err != nil {
-		t.Fatalf("second annotate: %v", err)
-	}
-
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-
-	got := distinctConversationIDs(t, db)
-	want := []string{"conv_b"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("conversation ids=%v want=%v", got, want)
-	}
-}
-
-func TestSpeakerCanonicalization_StripsMarkdown(t *testing.T) {
-	got := canonicalSpeakerLabel(" **Sales Rep ")
-	if got != speakerSalesRep {
-		t.Fatalf("canonical speaker label=%q want=%q", got, speakerSalesRep)
-	}
-	got = canonicalSpeakerLabel("**Customer")
-	if got != speakerCustomer {
-		t.Fatalf("canonical speaker label=%q want=%q", got, speakerCustomer)
-	}
-}
-
-func TestEmpathyConfidence_DefaultPendingReview(t *testing.T) {
-	tmp := t.TempDir()
-	csvDir := filepath.Join(tmp, "csv")
-	dbPath := filepath.Join(tmp, "annotations.db")
-	mock := newStructuredMockServer(t)
-	defer mock.Close()
-
-	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_a", "**Sales Rep", "**Customer")
-
-	err := AnnotateToSQLite(context.Background(), AnnotateConfig{
-		DBPath:   dbPath,
-		InputDir: csvDir,
-		FromIdx:  1,
-		ToIdx:    1,
-		Model:    defaultAnnotateModel,
-		APIKey:   "test_key",
-		BaseURL:  mock.URL,
-	})
-	if err != nil {
-		t.Fatalf("annotate: %v", err)
-	}
-
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-
-	var empathyConf float64
-	var reviewStatus string
-	var reviewNote string
+	var speakerAttempts int
 	if err := db.QueryRow(`
-		SELECT empathy_confidence, empathy_review_status, empathy_reviewer_note
-		FROM annotations
-		WHERE conversation_id = ? AND replica_id = 1
-	`, "conv_a").Scan(&empathyConf, &reviewStatus, &reviewNote); err != nil {
-		t.Fatalf("query sales rep row: %v", err)
+		SELECT COUNT(*)
+		FROM llm_events
+		WHERE conversation_id='conv_retry' AND utterance_index=1 AND unit_name='speaker'
+	`).Scan(&speakerAttempts); err != nil {
+		t.Fatalf("count speaker attempts: %v", err)
 	}
-	if empathyConf <= 0 {
-		t.Fatalf("sales-rep empathy confidence=%v want > 0", empathyConf)
-	}
-	if reviewStatus != reviewStatusPending {
-		t.Fatalf("review status=%q want=%q", reviewStatus, reviewStatusPending)
-	}
-	if reviewNote != "" {
-		t.Fatalf("review note=%q want empty", reviewNote)
+	if speakerAttempts != 2 {
+		t.Fatalf("speaker attempts=%d want=2", speakerAttempts)
 	}
 
-	var customerEmpathy float64
+	var evidenceIsValid int
 	if err := db.QueryRow(`
-		SELECT empathy_confidence
+		SELECT speaker_evidence_is_valid
 		FROM annotations
-		WHERE conversation_id = ? AND replica_id = 2
-	`, "conv_a").Scan(&customerEmpathy); err != nil {
-		t.Fatalf("query customer row: %v", err)
+		WHERE conversation_id='conv_retry' AND utterance_index=1
+	`).Scan(&evidenceIsValid); err != nil {
+		t.Fatalf("query speaker_evidence_is_valid: %v", err)
 	}
-	if customerEmpathy != 0 {
-		t.Fatalf("customer empathy confidence=%v want 0", customerEmpathy)
+	if evidenceIsValid != 1 {
+		t.Fatalf("speaker_evidence_is_valid=%d want=1 after successful retry", evidenceIsValid)
 	}
 }
 
-func TestAnnotate_UsesSGRQualityDecisionForFarewellContext(t *testing.T) {
+func TestAnnotate_SGRFarewellOverrideWritesRawAndFinal(t *testing.T) {
 	tmp := t.TempDir()
 	csvDir := filepath.Join(tmp, "csv")
 	dbPath := filepath.Join(tmp, "annotations.db")
@@ -285,279 +247,33 @@ func TestAnnotate_UsesSGRQualityDecisionForFarewellContext(t *testing.T) {
 	}
 	defer db.Close()
 
-	var speakerTrue string
-	var speakerPredicted string
-	var speakerMatch int
+	var rawCorrect int
+	var finalCorrect int
+	var qualityDecision string
 	if err := db.QueryRow(`
-		SELECT speaker_true, speaker_predicted, speaker_match
+		SELECT speaker_is_correct_raw, speaker_is_correct_final, speaker_quality_decision
 		FROM annotations
-		WHERE conversation_id = 'conv_farewell' AND replica_id = 2
-	`).Scan(&speakerTrue, &speakerPredicted, &speakerMatch); err != nil {
+		WHERE conversation_id='conv_farewell' AND utterance_index=2
+	`).Scan(&rawCorrect, &finalCorrect, &qualityDecision); err != nil {
 		t.Fatalf("query farewell annotation: %v", err)
 	}
-	if speakerTrue != speakerSalesRep {
-		t.Fatalf("speaker_true=%q want=%q", speakerTrue, speakerSalesRep)
+	if rawCorrect != 0 {
+		t.Fatalf("speaker_is_correct_raw=%d want=0", rawCorrect)
 	}
-	if speakerPredicted != speakerCustomer {
-		t.Fatalf("speaker_predicted=%q want=%q", speakerPredicted, speakerCustomer)
+	if finalCorrect != 1 {
+		t.Fatalf("speaker_is_correct_final=%d want=1", finalCorrect)
 	}
-	if speakerMatch != 1 {
-		t.Fatalf("speaker_match=%d want=1 because SGR override should clear farewell mismatch", speakerMatch)
-	}
-
-	var sgrMessage string
-	var sgrRawJSON string
-	if err := db.QueryRow(`
-		SELECT message, raw_json
-		FROM annotate_logs
-		WHERE conversation_id = 'conv_farewell' AND replica_id = 2 AND stage = 'sgr'
-		ORDER BY id DESC LIMIT 1
-	`).Scan(&sgrMessage, &sgrRawJSON); err != nil {
-		t.Fatalf("query sgr log row: %v", err)
-	}
-	if !strings.Contains(sgrMessage, "decision="+qualityDecisionFarewellOverride) {
-		t.Fatalf("sgr message=%q must contain farewell override decision", sgrMessage)
-	}
-	if !strings.Contains(sgrMessage, "raw_match=0") {
-		t.Fatalf("sgr message=%q must contain raw_match=0", sgrMessage)
-	}
-	if !strings.Contains(sgrMessage, "final_match=1") {
-		t.Fatalf("sgr message=%q must contain final_match=1", sgrMessage)
-	}
-
-	var sgrPayload map[string]any
-	if err := json.Unmarshal([]byte(sgrRawJSON), &sgrPayload); err != nil {
-		t.Fatalf("unmarshal sgr raw_json: %v raw=%s", err, sgrRawJSON)
-	}
-	if sgrPayload["quality_decision"] != qualityDecisionFarewellOverride {
-		t.Fatalf("quality_decision=%v want=%q", sgrPayload["quality_decision"], qualityDecisionFarewellOverride)
-	}
-	if sgrPayload["farewell_context"] != true {
-		t.Fatalf("farewell_context=%v want=true", sgrPayload["farewell_context"])
-	}
-	if sgrPayload["raw_match"] != float64(0) {
-		t.Fatalf("raw_match=%v want=0", sgrPayload["raw_match"])
-	}
-	if sgrPayload["final_match"] != float64(1) {
-		t.Fatalf("final_match=%v want=1", sgrPayload["final_match"])
-	}
-}
-
-func TestAnnotate_WritesLLMResponseAndErrorLogs(t *testing.T) {
-	tmp := t.TempDir()
-	csvDir := filepath.Join(tmp, "csv")
-	dbPath := filepath.Join(tmp, "annotations.db")
-	mock := newInvalidQuoteMockServer(t)
-	defer mock.Close()
-
-	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_fail", speakerSalesRep, speakerCustomer)
-
-	err := AnnotateToSQLite(context.Background(), AnnotateConfig{
-		DBPath:   dbPath,
-		InputDir: csvDir,
-		FromIdx:  1,
-		ToIdx:    1,
-		Model:    defaultAnnotateModel,
-		APIKey:   "test_key",
-		BaseURL:  mock.URL,
-	})
-	if err != nil {
-		t.Fatalf("annotate should continue on llm validation errors: %v", err)
-	}
-
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-
-	var speakerInfo int
-	if err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM annotate_logs
-		WHERE conversation_id = 'conv_fail' AND replica_id = 1 AND stage = 'speaker' AND status = 'info'
-	`).Scan(&speakerInfo); err != nil {
-		t.Fatalf("query speaker info logs: %v", err)
-	}
-	if speakerInfo == 0 {
-		t.Fatalf("expected speaker info log row")
-	}
-
-	var speakerErr int
-	if err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM annotate_logs
-		WHERE conversation_id = 'conv_fail' AND replica_id = 1 AND stage = 'speaker' AND status = 'error' AND message LIKE '%quote_not_substring%'
-	`).Scan(&speakerErr); err != nil {
-		t.Fatalf("query speaker error logs: %v", err)
-	}
-	if speakerErr == 0 {
-		t.Fatalf("expected speaker quote_not_substring error log row")
-	}
-
-	var pipelineErr int
-	if err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM annotate_logs
-		WHERE conversation_id = 'conv_fail' AND replica_id = 1 AND stage = 'pipeline' AND status = 'error' AND message LIKE '%replica_failed%'
-	`).Scan(&pipelineErr); err != nil {
-		t.Fatalf("query pipeline error logs: %v", err)
-	}
-	if pipelineErr == 0 {
-		t.Fatalf("expected pipeline replica_failed error log row")
-	}
-
-	var annotationRows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM annotations WHERE conversation_id = 'conv_fail'`).Scan(&annotationRows); err != nil {
-		t.Fatalf("count annotations: %v", err)
-	}
-	if annotationRows == 0 {
-		t.Fatalf("expected annotations to be inserted even on llm validation errors")
-	}
-
-	var rawContent string
-	if err := db.QueryRow(`
-		SELECT raw_json
-		FROM annotate_logs
-		WHERE conversation_id = 'conv_fail' AND replica_id = 1 AND stage = 'speaker' AND status = 'info'
-		ORDER BY id DESC LIMIT 1
-	`).Scan(&rawContent); err != nil {
-		t.Fatalf("query speaker info raw_json: %v", err)
-	}
-	if !strings.Contains(rawContent, `"predicted_speaker"`) {
-		t.Fatalf("speaker raw_json does not contain model response: %s", rawContent)
-	}
-}
-
-func TestAnnotate_ClearsOldLogsOnStart(t *testing.T) {
-	tmp := t.TempDir()
-	csvDir := filepath.Join(tmp, "csv")
-	dbPath := filepath.Join(tmp, "annotations.db")
-	mock := newStructuredMockServer(t)
-	defer mock.Close()
-
-	if err := SetupSQLite(dbPath); err != nil {
-		t.Fatalf("setup sqlite: %v", err)
-	}
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-
-	if _, err := db.Exec(
-		insertAnnotateLogSQL,
-		time.Now().UTC().Format(time.RFC3339),
-		"old_conv",
-		1,
-		"pipeline",
-		"error",
-		"old_log_marker",
-		"{}",
-		"old_model",
-	); err != nil {
-		t.Fatalf("seed old log: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close sqlite: %v", err)
-	}
-
-	mustWriteDialogCSV(t, csvDir, "a.csv", "conv_new", speakerSalesRep, speakerCustomer)
-	if err := AnnotateToSQLite(context.Background(), AnnotateConfig{
-		DBPath:   dbPath,
-		InputDir: csvDir,
-		FromIdx:  1,
-		ToIdx:    1,
-		Model:    defaultAnnotateModel,
-		APIKey:   "test_key",
-		BaseURL:  mock.URL,
-	}); err != nil {
-		t.Fatalf("annotate: %v", err)
-	}
-	db, err = openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite after annotate: %v", err)
-	}
-	defer db.Close()
-
-	var oldCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM annotate_logs WHERE message = 'old_log_marker'`).Scan(&oldCount); err != nil {
-		t.Fatalf("query old log marker: %v", err)
-	}
-	if oldCount != 0 {
-		t.Fatalf("old logs were not cleared, old_count=%d", oldCount)
-	}
-
-	var newCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM annotate_logs`).Scan(&newCount); err != nil {
-		t.Fatalf("count new logs: %v", err)
-	}
-	if newCount == 0 {
-		t.Fatalf("expected new log rows after annotate")
-	}
-}
-
-type seededAnnotation struct {
-	ConversationID    string
-	ReplicaID         int
-	SpeakerTrue       string
-	SpeakerPredicted  string
-	SpeakerConfidence float64
-	SpeakerMatch      int
-	EmpathyConfidence float64
-	ReviewStatus      string
-	ReviewerNote      string
-	ReplicaText       string
-	Model             string
-	AnnotatedAtUTC    string
-}
-
-func insertSeededAnnotation(t *testing.T, dbPath string, row seededAnnotation) {
-	t.Helper()
-	db, err := openSQLite(dbPath)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-
-	if strings.TrimSpace(row.Model) == "" {
-		row.Model = "seed_model"
-	}
-	if strings.TrimSpace(row.ReviewStatus) == "" {
-		row.ReviewStatus = reviewStatusPending
-	}
-	if row.AnnotatedAtUTC == "" {
-		row.AnnotatedAtUTC = time.Now().UTC().Format(time.RFC3339)
-	}
-
-	if _, err := db.Exec(
-		insertAnnotationSQL,
-		row.ConversationID,
-		row.ReplicaID,
-		row.SpeakerTrue,
-		row.SpeakerPredicted,
-		row.SpeakerConfidence,
-		row.SpeakerMatch,
-		row.EmpathyConfidence,
-		row.ReviewStatus,
-		row.ReviewerNote,
-		row.ReplicaText,
-		row.Model,
-		row.AnnotatedAtUTC,
-	); err != nil {
-		t.Fatalf("insert seeded annotation: %v", err)
+	if qualityDecision != qualityDecisionFarewellOverride {
+		t.Fatalf("speaker_quality_decision=%q want=%q", qualityDecision, qualityDecisionFarewellOverride)
 	}
 }
 
 func newStructuredMockServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	currentTextExpr := regexp.MustCompile(`current: "(.*?)"`)
+	currentTextExpr := regexp.MustCompile(`current_text: "(.*?)"`)
 
-	type requestMessage struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
 	type requestBody struct {
-		Messages       []requestMessage `json:"messages"`
+		Messages       []mockRequestMessage `json:"messages"`
 		ResponseFormat struct {
 			JSONSchema struct {
 				Name string `json:"name"`
@@ -570,46 +286,32 @@ func newStructuredMockServer(t *testing.T) *httptest.Server {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-
-		currentText := ""
-		for _, m := range req.Messages {
-			if m.Role != "user" {
-				continue
-			}
-			match := currentTextExpr.FindStringSubmatch(m.Content)
-			if len(match) > 1 {
-				currentText = match[1]
-				break
-			}
-		}
+		currentText := extractCurrentText(req.Messages, currentTextExpr)
 
 		content := "{}"
 		switch req.ResponseFormat.JSONSchema.Name {
-		case "speaker_case_v1":
+		case "speaker_case_v2":
 			predicted := speakerSalesRep
-			if strings.Contains(strings.ToLower(currentText), "customer") {
+			if strings.Contains(strings.ToLower(currentText), "customer") || strings.Contains(strings.ToLower(currentText), "thanks, bye") {
 				predicted = speakerCustomer
 			}
-			lowerCurrent := strings.ToLower(currentText)
-			isFarewell := strings.Contains(lowerCurrent, "bye") || strings.Contains(lowerCurrent, "goodbye")
-			contextSource := farewellContextSourceNone
-			if isFarewell {
-				contextSource = farewellContextSourceCurrent
-			}
-			quote := firstQuoteToken(currentText)
 			content = mustJSONString(t, map[string]any{
-				"predicted_speaker":     predicted,
-				"confidence":            0.91,
-				"is_farewell_utterance": isFarewell,
-				"is_farewell_context":   isFarewell,
-				"context_source":        contextSource,
-				"evidence": map[string]any{
-					"quote": quote,
+				"farewell": map[string]any{
+					"is_current_farewell": false,
+					"is_closing_context":  false,
+					"context_source":      farewellContextSourceNone,
+				},
+				"speaker": map[string]any{
+					"predicted_speaker": predicted,
+					"confidence":        0.91,
+					"evidence_quote":    firstQuoteToken(currentText),
 				},
 			})
-		case "empathy_confidence_v1":
+		case "empathy_case_v2":
 			content = mustJSONString(t, map[string]any{
-				"confidence": 0.83,
+				"empathy_present": true,
+				"confidence":      0.83,
+				"evidence_quote":  firstQuoteToken(currentText),
 			})
 		default:
 			w.WriteHeader(http.StatusBadRequest)
@@ -636,28 +338,66 @@ func newStructuredMockServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(handler)
 }
 
-func newInvalidQuoteMockServer(t *testing.T) *httptest.Server {
+func newRetrySpeakerMockServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	currentTextExpr := regexp.MustCompile(`current_text: "(.*?)"`)
+	attemptByText := map[string]int{}
+	var mu sync.Mutex
+
+	type requestBody struct {
+		Messages       []mockRequestMessage `json:"messages"`
+		ResponseFormat struct {
+			JSONSchema struct {
+				Name string `json:"name"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		content := mustJSONString(t, map[string]any{
-			"predicted_speaker":     speakerSalesRep,
-			"confidence":            0.9,
-			"is_farewell_utterance": false,
-			"is_farewell_context":   false,
-			"context_source":        farewellContextSourceNone,
-			"evidence": map[string]any{
-				"quote": "this_quote_is_missing",
-			},
-		})
-		resp := map[string]any{
-			"choices": []map[string]any{
-				{
-					"message": map[string]any{
-						"content": content,
-						"refusal": "",
-					},
+		var req requestBody
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		currentText := extractCurrentText(req.Messages, currentTextExpr)
+
+		content := "{}"
+		switch req.ResponseFormat.JSONSchema.Name {
+		case "speaker_case_v2":
+			mu.Lock()
+			attemptByText[currentText]++
+			attempt := attemptByText[currentText]
+			mu.Unlock()
+
+			evidence := firstQuoteToken(currentText)
+			if attempt == 1 {
+				evidence = "this_quote_is_missing"
+			}
+			content = mustJSONString(t, map[string]any{
+				"farewell": map[string]any{
+					"is_current_farewell": false,
+					"is_closing_context":  false,
+					"context_source":      farewellContextSourceNone,
 				},
-			},
+				"speaker": map[string]any{
+					"predicted_speaker": speakerSalesRep,
+					"confidence":        0.9,
+					"evidence_quote":    evidence,
+				},
+			})
+		case "empathy_case_v2":
+			content = mustJSONString(t, map[string]any{
+				"empathy_present": true,
+				"confidence":      0.8,
+				"evidence_quote":  firstQuoteToken(currentText),
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected schema"}`))
+			return
+		}
+
+		resp := map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": content, "refusal": ""}}},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -669,14 +409,10 @@ func newInvalidQuoteMockServer(t *testing.T) *httptest.Server {
 
 func newFarewellOverrideMockServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	currentTextExpr := regexp.MustCompile(`current: "(.*?)"`)
+	currentTextExpr := regexp.MustCompile(`current_text: "(.*?)"`)
 
-	type requestMessage struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
 	type requestBody struct {
-		Messages       []requestMessage `json:"messages"`
+		Messages       []mockRequestMessage `json:"messages"`
 		ResponseFormat struct {
 			JSONSchema struct {
 				Name string `json:"name"`
@@ -689,46 +425,37 @@ func newFarewellOverrideMockServer(t *testing.T) *httptest.Server {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-
-		currentText := ""
-		for _, m := range req.Messages {
-			if m.Role != "user" {
-				continue
-			}
-			match := currentTextExpr.FindStringSubmatch(m.Content)
-			if len(match) > 1 {
-				currentText = match[1]
-				break
-			}
-		}
+		currentText := extractCurrentText(req.Messages, currentTextExpr)
 
 		content := "{}"
 		switch req.ResponseFormat.JSONSchema.Name {
-		case "speaker_case_v1":
-			lowerCurrent := strings.ToLower(currentText)
-			isFarewell := strings.Contains(lowerCurrent, "bye") || strings.Contains(lowerCurrent, "goodbye")
+		case "speaker_case_v2":
+			isFarewell := strings.Contains(strings.ToLower(currentText), "bye") || strings.Contains(strings.ToLower(currentText), "goodbye")
+			predicted := speakerSalesRep
+			if isFarewell {
+				predicted = speakerCustomer // намеренный raw mismatch для проверки override
+			}
 			contextSource := farewellContextSourceNone
 			if isFarewell {
 				contextSource = farewellContextSourceCurrent
 			}
-			predicted := speakerSalesRep
-			if isFarewell {
-				// Специально эмулируем raw mismatch на прощании, чтобы проверить SGR-override.
-				predicted = speakerCustomer
-			}
 			content = mustJSONString(t, map[string]any{
-				"predicted_speaker":     predicted,
-				"confidence":            0.89,
-				"is_farewell_utterance": isFarewell,
-				"is_farewell_context":   isFarewell,
-				"context_source":        contextSource,
-				"evidence": map[string]any{
-					"quote": firstQuoteToken(currentText),
+				"farewell": map[string]any{
+					"is_current_farewell": isFarewell,
+					"is_closing_context":  isFarewell,
+					"context_source":      contextSource,
+				},
+				"speaker": map[string]any{
+					"predicted_speaker": predicted,
+					"confidence":        0.89,
+					"evidence_quote":    firstQuoteToken(currentText),
 				},
 			})
-		case "empathy_confidence_v1":
+		case "empathy_case_v2":
 			content = mustJSONString(t, map[string]any{
-				"confidence": 0.77,
+				"empathy_present": true,
+				"confidence":      0.77,
+				"evidence_quote":  firstQuoteToken(currentText),
 			})
 		default:
 			w.WriteHeader(http.StatusBadRequest)
@@ -737,21 +464,28 @@ func newFarewellOverrideMockServer(t *testing.T) *httptest.Server {
 		}
 
 		resp := map[string]any{
-			"choices": []map[string]any{
-				{
-					"message": map[string]any{
-						"content": content,
-						"refusal": "",
-					},
-				},
-			},
+			"choices": []map[string]any{{"message": map[string]any{"content": content, "refusal": ""}}},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			t.Fatalf("encode response: %v", err)
 		}
 	})
+
 	return httptest.NewServer(handler)
+}
+
+func extractCurrentText(messages []mockRequestMessage, expr *regexp.Regexp) string {
+	for _, msg := range messages {
+		if msg.Role != "user" {
+			continue
+		}
+		match := expr.FindStringSubmatch(msg.Content)
+		if len(match) > 1 {
+			return match[1]
+		}
+	}
+	return ""
 }
 
 func firstQuoteToken(text string) string {
@@ -759,11 +493,11 @@ func firstQuoteToken(text string) string {
 	if text == "" {
 		return "."
 	}
-	fields := strings.Fields(text)
-	if len(fields) == 0 {
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
 		return text
 	}
-	return fields[0]
+	return parts[0]
 }
 
 func mustWriteDialogCSV(t *testing.T, dir, fileName, conversationID, salesRepLabel, customerLabel string) {
@@ -784,40 +518,25 @@ func mustWriteDialogCSV(t *testing.T, dir, fileName, conversationID, salesRepLab
 
 func mustJSONString(t *testing.T, v any) string {
 	t.Helper()
-	data, err := json.Marshal(v)
+	b, err := json.Marshal(v)
 	if err != nil {
 		t.Fatalf("marshal json: %v", err)
 	}
-	return string(data)
+	return string(b)
 }
 
 func tableExists(t *testing.T, db *sql.DB, tableName string) bool {
 	t.Helper()
 	var count int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?`,
-		tableName,
-	).Scan(&count); err != nil {
-		t.Fatalf("check table exists: %v", err)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, tableName).Scan(&count); err != nil {
+		t.Fatalf("query table exists: %v", err)
 	}
 	return count > 0
 }
 
-func indexExists(t *testing.T, db *sql.DB, indexName string) bool {
+func tableColumns(t *testing.T, db *sql.DB, tableName string) []string {
 	t.Helper()
-	var count int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?`,
-		indexName,
-	).Scan(&count); err != nil {
-		t.Fatalf("check index exists: %v", err)
-	}
-	return count > 0
-}
-
-func annotationColumns(t *testing.T, db *sql.DB) []string {
-	t.Helper()
-	rows, err := db.Query(`PRAGMA table_info(annotations)`)
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, tableName))
 	if err != nil {
 		t.Fatalf("query table info: %v", err)
 	}
@@ -839,28 +558,6 @@ func annotationColumns(t *testing.T, db *sql.DB) []string {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate table info: %v", err)
 	}
+	sort.Strings(cols)
 	return cols
-}
-
-func distinctConversationIDs(t *testing.T, db *sql.DB) []string {
-	t.Helper()
-	rows, err := db.Query(`SELECT DISTINCT conversation_id FROM annotations ORDER BY conversation_id`)
-	if err != nil {
-		t.Fatalf("query conversations: %v", err)
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			t.Fatalf("scan conversation id: %v", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate conversations: %v", err)
-	}
-	sort.Strings(ids)
-	return ids
 }

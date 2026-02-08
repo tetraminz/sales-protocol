@@ -140,7 +140,7 @@ func runReportCmd(args []string) error {
 func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  go run . setup --db out/annotations.db")
-	fmt.Println("  OPENAI_API_KEY=... go run . annotate --db out/annotations.db --input_dir /Users/ablackman/data/sales-transcripts/data/chunked_transcripts --from_idx 1 --to_idx 20 --model gpt-4.1-mini")
+	fmt.Println("  OPENAI_API_KEY=... go run . annotate --db out/annotations.db --input_dir sales-transcripts/data/chunked_transcripts --from_idx 1 --to_idx 20 --model gpt-4.1-mini")
 	fmt.Println("  go run . analytics --db out/annotations.db --out out/analytics_latest.md")
 	fmt.Println("  go run . debug-release --db out/annotations.db --out out/release_debug_latest.md")
 	fmt.Println("  go run . report --db out/annotations.db")

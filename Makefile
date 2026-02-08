@@ -1,5 +1,5 @@
 DB ?= out/annotations.db
-INPUT_DIR ?= /Users/ablackman/data/sales-transcripts/data/chunked_transcripts
+INPUT_DIR ?= sales-transcripts/data/chunked_transcripts
 FROM ?= 1
 TO ?= 20
 MODEL ?= gpt-4.1-mini
@@ -9,7 +9,7 @@ MODEL ?= gpt-4.1-mini
 help:
 	@echo "Targets:"
 	@echo "  make setup DB=out/annotations.db"
-	@echo "  OPENAI_API_KEY=... make annotate DB=out/annotations.db INPUT_DIR=/path FROM=1 TO=20 MODEL=gpt-4.1-mini"
+	@echo "  OPENAI_API_KEY=... make annotate DB=out/annotations.db INPUT_DIR=sales-transcripts/data/chunked_transcripts FROM=1 TO=20 MODEL=gpt-4.1-mini"
 	@echo "  make analytics DB=out/annotations.db"
 	@echo "  make debug-release DB=out/annotations.db"
 	@echo "  make report DB=out/annotations.db"

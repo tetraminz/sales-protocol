@@ -1,17 +1,15 @@
 # sales_protocol
 
-KISS-процесс разметки:
-- бизнес-оркестрация SGR в `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/business_process_sgr.go` (без SQL/IO)
-- аннотация CSV напрямую в SQLite (один актуальный срез, без `run_id`)
-- speaker и empathy confidence считаются через OpenAI
-- финальная проверка empathy делается вручную в SQLite (`pending|ok|not_ok`)
-- analytics/debug/report строятся из текущего состояния базы
+KISS-демо Schema-Guided Reasoning (SGR) для разметки sales-transcripts:
+- вход: CSV из `sales-transcripts/data/chunked_transcripts`
+- выход: SQLite (`annotations`, `llm_events`) + markdown отчеты
+- центральная бизнес-спецификация: `business_process_sgr.go`
 
 ## Команды
 
 ```bash
 go run . setup --db out/annotations.db
-go run . annotate --db out/annotations.db --input_dir /Users/ablackman/data/sales-transcripts/data/chunked_transcripts --from_idx 1 --to_idx 5 --model gpt-4.1-mini
+OPENAI_API_KEY=... go run . annotate --db out/annotations.db --input_dir sales-transcripts/data/chunked_transcripts --from_idx 1 --to_idx 20 --model gpt-4.1-mini
 go run . analytics --db out/annotations.db --out out/analytics_latest.md
 go run . debug-release --db out/annotations.db --out out/release_debug_latest.md
 go run . report --db out/annotations.db
@@ -29,68 +27,42 @@ make release-check
 make test
 ```
 
-## Минимальная схема
+## Архитектура
 
-Таблица `annotations`:
-- `conversation_id`, `replica_id` (PK)
-- `speaker_true`, `speaker_predicted`, `speaker_confidence`, `speaker_match`
-- `empathy_confidence`, `empathy_review_status`, `empathy_reviewer_note`
-- `replica_text`, `model`, `annotated_at_utc`
+- `business_process_sgr.go` — бизнес-процесс и SGR инварианты (raw/final, farewell override)
+- `pipeline_annotate.go` — orchestration run
+- `input_sales_transcripts.go` — чтение CSV и сбор utterance blocks
+- `llm_openai_client.go` — strict JSON вызов OpenAI
+- `llm_cases_speaker.go` — speaker unit (farewell + speaker)
+- `llm_cases_empathy.go` — empathy unit
+- `store_sqlite.go` — schema + запись `annotations` и `llm_events`
+- `reporting.go` — analytics/debug/report
 
-`setup` делает hard reset схемы, `annotate` очищает `annotations` и записывает новый срез.
-Если база от старой версии, сначала обязательно выполнить `setup`.
+## SQLite: ключевые поля
 
-## Логи annotate
+`annotations`:
+- `conversation_id`, `utterance_index` (PK)
+- `ground_truth_speaker`, `predicted_speaker`, `predicted_speaker_confidence`
+- `speaker_is_correct_raw`, `speaker_is_correct_final`, `speaker_quality_decision`
+- `farewell_is_current_utterance`, `farewell_is_conversation_closing`, `farewell_context_source`
+- `speaker_evidence_quote`, `speaker_evidence_is_valid`
+- `empathy_applicable`, `empathy_present`, `empathy_confidence`, `empathy_evidence_quote`
+- `empathy_review_status` (`pending|ok|not_ok|not_applicable`), `empathy_reviewer_note`
+- `utterance_text`, `model`, `annotated_at_utc`
 
-Во время `annotate` печатаются:
-- `annotate_start`
-- `annotate_file`
-- `annotate_row`
-- `annotate_progress` (каждые 25 реплик)
-- `annotate_done`
-- `annotate_log` (speaker/empathy/pipeline info+error для дебага LLM)
+`llm_events` (аудит каждой попытки):
+- `unit_name`, `attempt`, `request_json`, `response_http_status`, `response_json`
+- `extracted_content_json`, `parse_ok`, `validation_ok`, `error_message`
 
-Также эти логи пишутся в таблицу `annotate_logs`.
-Если LLM дал невалидный ответ, `annotate` продолжает run, пишет error в `annotate_logs` и сохраняет реплику в `annotations`.
+## SQL гайд
 
-Все фейлы:
+Готовые SQL для аналитики/дебага/manual review:
+- `docs/sql_analytics_debug_review.md`
 
-```sql
-SELECT created_at_utc, conversation_id, replica_id, stage, message
-FROM annotate_logs
-WHERE status='error'
-ORDER BY id;
+## Важно про миграцию
+
+Это hard-refactor по схеме. Перед annotate выполняйте:
+
+```bash
+go run . setup --db out/annotations.db
 ```
-
-Последний ответ модели для конкретной реплики:
-
-```sql
-SELECT stage, status, message, raw_json
-FROM annotate_logs
-WHERE conversation_id='...' AND replica_id=...
-ORDER BY id DESC;
-```
-
-## Manual empathy review (SQL)
-
-Pending:
-
-```sql
-SELECT conversation_id, replica_id, replica_text, empathy_confidence
-FROM annotations
-WHERE empathy_review_status = 'pending'
-ORDER BY empathy_confidence DESC;
-```
-
-Mark reviewed:
-
-```sql
-UPDATE annotations
-SET empathy_review_status = 'ok', empathy_reviewer_note = 'looks good'
-WHERE conversation_id = 'conv_id' AND replica_id = 10;
-```
-
-## Ссылки
-
-- ТЗ: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/docs/CODEX_TZ_guided_reasoning_minimal.md`
-- SGR reference: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/docs/SKILL.md`

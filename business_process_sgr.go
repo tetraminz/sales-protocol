@@ -6,162 +6,124 @@ import (
 	"strings"
 )
 
-const speakerSalesRep = "Sales Rep"
-
-const (
-	qualityDecisionStrictMatch      = "strict_match"
-	qualityDecisionStrictMismatch   = "strict_mismatch"
-	qualityDecisionNoGroundTruth    = "no_ground_truth"
-	qualityDecisionFarewellOverride = "farewell_context_override"
-)
-
-// AnnotationBusinessProcess is the business-level SGR documentation in code.
+// AnnotationBusinessProcess — главная SGR-спецификация процесса в коде.
 //
-// CASCADE:
-// 1) classify speaker for the replica
-// 2) if needed, run empathy analysis
+// Термины:
+// - Conversation: один диалог (обычно один CSV файл)
+// - Turn: исходная строка датасета
+// - Utterance Block: несколько подряд turn от одного говорящего, склеенные в один блок
+//
+// CASCADE (пошаговая логика):
+// 1) Speaker unit определяет predicted speaker и признаки farewell-контекста.
+// 2) SGR quality decision считает raw/final корректность.
+// 3) ROUTING empathy: empathy применяется только для ground truth = Sales Rep.
 //
 // ROUTING:
-// empathy case runs only for Sales Rep replicas
+// - Empathy unit не вызывается для Customer строк.
 //
 // CYCLE:
-// retry strategy lives inside case implementations; process only orchestrates cases
-// and keeps control flow explicit.
+// - Retry находится внутри конкретных LLM unit (speaker/empathy).
 //
-// This file intentionally has no SQL, files, HTTP, or storage parsing.
-
-type ProcessInput struct {
-	ReplicaText string
-	PrevText    string
-	NextText    string
-	SpeakerTrue string
+// Важный инвариант:
+// - predicted speaker НИКОГДА не переписываем на бизнес-уровне.
+// - SGR меняет только оценку качества (speaker_is_correct_final).
+// Это позволяет прозрачно видеть, где LLM ошиблась raw, но бизнес осознанно снял красноту
+// для прощального closing-контекста.
+type AnnotationBusinessProcess struct {
+	SpeakerUnit SpeakerUnit
+	EmpathyUnit EmpathyUnit
 }
 
-type ProcessOutput struct {
-	Speaker ReplicaCaseResult
-	Empathy EmpathyCaseResult
+type SpeakerUnit interface {
+	Evaluate(ctx context.Context, in SpeakerCaseInput) (SpeakerCaseResult, error)
 }
 
-type ReplicaCaseInput struct {
-	ReplicaText string
-	PrevText    string
-	NextText    string
-}
-
-type ReplicaCaseResult struct {
-	PredictedSpeaker      string
-	Confidence            float64
-	EvidenceQuote         string
-	FarewellUtterance     bool
-	FarewellContext       bool
-	FarewellContextSource string
-	QualityMismatch       bool
-	QualityDecision       string
-}
-
-type EmpathyCaseInput struct {
-	ReplicaText string
-	SpeakerTrue string
-}
-
-type EmpathyCaseResult struct {
-	Ran            bool
-	EmpathyPresent bool
-	EmpathyType    string
-	Confidence     float64
-	EvidenceQuote  string
-}
-
-type ReplicaSpeakerCase interface {
-	Evaluate(ctx context.Context, in ReplicaCaseInput) (ReplicaCaseResult, error)
-}
-
-type EmpathyCase interface {
+type EmpathyUnit interface {
 	Evaluate(ctx context.Context, in EmpathyCaseInput) (EmpathyCaseResult, error)
 }
 
-type AnnotationBusinessProcess struct {
-	SpeakerCase ReplicaSpeakerCase
-	EmpathyCase EmpathyCase
-}
-
 func (p AnnotationBusinessProcess) Run(ctx context.Context, in ProcessInput) (ProcessOutput, error) {
-	if p.SpeakerCase == nil {
-		return ProcessOutput{}, fmt.Errorf("speaker case is required")
+	if p.SpeakerUnit == nil {
+		return ProcessOutput{}, fmt.Errorf("speaker unit is required")
 	}
 
-	// CASCADE / Шаг 1:
-	// Получаем "сырой" результат классификации говорящего и сигналы про контекст прощания.
-	speaker, err := p.SpeakerCase.Evaluate(ctx, ReplicaCaseInput{
-		ReplicaText: in.ReplicaText,
-		PrevText:    in.PrevText,
-		NextText:    in.NextText,
+	// Step A: speaker unit (LLM) работает только по текстовому контексту.
+	speakerRaw, err := p.SpeakerUnit.Evaluate(ctx, SpeakerCaseInput{
+		PreviousText: in.PreviousText,
+		CurrentText:  in.UtteranceText,
+		NextText:     in.NextText,
 	})
 	if err != nil {
-		return ProcessOutput{}, fmt.Errorf("speaker case: %w", err)
+		return ProcessOutput{}, fmt.Errorf("speaker unit: %w", err)
 	}
 
-	// CASCADE / Шаг 2 (отдельное бизнес-решение качества):
-	// 1) Считаем raw mismatch только как сравнение true/predicted.
-	// 2) ROUTING: если это mismatch, но LLM пометил "контекст прощания",
-	//    снимаем mismatch на уровне quality.
-	//
-	// Важно: predicted speaker НЕ переписываем. Это осознанное решение:
-	// - сохраняем оригинальный вывод speaker-case для аудита и отладки;
-	// - меняем только бизнес-оценку качества, чтобы не краснить финальные прощания.
-	speaker.QualityMismatch, speaker.QualityDecision = decideSpeakerQuality(
-		in.SpeakerTrue,
-		speaker.PredictedSpeaker,
-		speaker.FarewellContext,
+	// Step B: бизнес-решение качества (raw vs final).
+	rawCorrect, finalCorrect, qualityDecision := decideSpeakerQuality(
+		in.GroundTruthSpeaker,
+		speakerRaw.PredictedSpeaker,
+		speakerRaw.FarewellIsConversationClosing,
 	)
 
-	// ROUTING: skip empathy for non-sales-rep replicas.
-	empathy := EmpathyCaseResult{
-		Ran:            false,
-		EmpathyPresent: false,
-		EmpathyType:    "none",
-		Confidence:     0,
-		EvidenceQuote:  "",
+	speakerDecision := SpeakerDecision{
+		PredictedSpeaker:              speakerRaw.PredictedSpeaker,
+		PredictedSpeakerConfidence:    clamp01(speakerRaw.PredictedSpeakerConfidence),
+		FarewellIsCurrentUtterance:    speakerRaw.FarewellIsCurrentUtterance,
+		FarewellIsConversationClosing: speakerRaw.FarewellIsConversationClosing,
+		FarewellContextSource:         normalizeFarewellContextSource(speakerRaw.FarewellContextSource),
+		SpeakerEvidenceQuote:          strings.TrimSpace(speakerRaw.SpeakerEvidenceQuote),
+		SpeakerEvidenceIsValid:        speakerRaw.SpeakerEvidenceIsValid,
+		SpeakerIsCorrectRaw:           rawCorrect,
+		SpeakerIsCorrectFinal:         finalCorrect,
+		SpeakerQualityDecision:        qualityDecision,
 	}
 
-	if in.SpeakerTrue == speakerSalesRep {
-		if p.EmpathyCase == nil {
-			return ProcessOutput{}, fmt.Errorf("empathy case is required for sales rep replicas")
+	// Step C: routing empathy (только для Sales Rep по ground truth).
+	empathyDecision := EmpathyDecision{
+		EmpathyApplicable:      false,
+		EmpathyPresent:         false,
+		EmpathyConfidence:      0,
+		EmpathyEvidenceQuote:   "",
+		EmpathyEvidenceIsValid: false,
+	}
+
+	if canonicalSpeakerLabel(in.GroundTruthSpeaker) == speakerSalesRep {
+		if p.EmpathyUnit == nil {
+			return ProcessOutput{}, fmt.Errorf("empathy unit is required for sales-rep utterance")
 		}
-		empathy, err = p.EmpathyCase.Evaluate(ctx, EmpathyCaseInput{
-			ReplicaText: in.ReplicaText,
-			SpeakerTrue: in.SpeakerTrue,
-		})
+		empathyRaw, err := p.EmpathyUnit.Evaluate(ctx, EmpathyCaseInput{CurrentText: in.UtteranceText})
 		if err != nil {
-			return ProcessOutput{}, fmt.Errorf("empathy case: %w", err)
+			return ProcessOutput{}, fmt.Errorf("empathy unit: %w", err)
+		}
+		empathyDecision = EmpathyDecision{
+			EmpathyApplicable:      true,
+			EmpathyPresent:         empathyRaw.EmpathyPresent,
+			EmpathyConfidence:      clamp01(empathyRaw.EmpathyConfidence),
+			EmpathyEvidenceQuote:   strings.TrimSpace(empathyRaw.EmpathyEvidenceQuote),
+			EmpathyEvidenceIsValid: empathyRaw.EmpathyEvidenceIsValid,
 		}
 	}
 
 	return ProcessOutput{
-		Speaker: speaker,
-		Empathy: empathy,
+		Speaker: speakerDecision,
+		Empathy: empathyDecision,
 	}, nil
 }
 
-func decideSpeakerQuality(speakerTrue, speakerPredicted string, farewellContext bool) (bool, string) {
-	speakerTrue = strings.TrimSpace(speakerTrue)
-	speakerPredicted = strings.TrimSpace(speakerPredicted)
-	if speakerTrue == "" || speakerPredicted == "" {
-		// Нет одной из опорных меток -> mismatch не считаем, чтобы не вносить шум в quality.
-		return false, qualityDecisionNoGroundTruth
+func decideSpeakerQuality(groundTruthSpeaker, predictedSpeaker string, farewellClosing bool) (bool, bool, string) {
+	gt := strings.TrimSpace(groundTruthSpeaker)
+	pred := strings.TrimSpace(predictedSpeaker)
+	if gt == "" || pred == "" {
+		return false, false, qualityDecisionNoGroundTruth
 	}
 
-	rawMismatch := speakerPredicted != speakerTrue
-	if !rawMismatch {
-		return false, qualityDecisionStrictMatch
+	rawCorrect := pred == gt
+	if rawCorrect {
+		return true, true, qualityDecisionStrictMatch
 	}
 
-	if farewellContext {
-		// Узкий целевой кейс:
-		// реплика попала в финальный "прощальный" обмен, поэтому raw mismatch
-		// не считаем качественной ошибкой speaker-модели.
-		return false, qualityDecisionFarewellOverride
+	if farewellClosing {
+		// Смысл override: raw ошибка сохраняется как факт, но final бизнес-метрика зелёная.
+		return false, true, qualityDecisionFarewellOverride
 	}
-
-	return true, qualityDecisionStrictMismatch
+	return false, false, qualityDecisionStrictMismatch
 }

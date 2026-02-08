@@ -2,226 +2,157 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
-	"time"
 )
 
-func TestSpeakerCase_LLMOnly(t *testing.T) {
-	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		content := mustJSONString(t, map[string]any{
-			"predicted_speaker":     speakerCustomer,
-			"confidence":            0.31,
-			"is_farewell_utterance": false,
-			"is_farewell_context":   false,
-			"context_source":        "none",
-			"evidence": map[string]any{
-				"quote": "Thanks",
-			},
-		})
-		resp := map[string]any{
-			"choices": []map[string]any{
-				{
-					"message": map[string]any{
-						"content": content,
-						"refusal": "",
-					},
-				},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			t.Fatalf("encode mock response: %v", err)
-		}
-	}))
-	defer mock.Close()
-
-	c := &openAISpeakerCase{
-		client: &openAIClient{
-			apiKey:  "test_key",
-			baseURL: mock.URL,
-			httpClient: &http.Client{
-				Timeout: 5 * time.Second,
-			},
-		},
-		model: defaultAnnotateModel,
-	}
-
-	out, err := c.Evaluate(context.Background(), ReplicaCaseInput{
-		ReplicaText: "Thanks for your help.",
-		PrevText:    "Can you help me?",
-		NextText:    "Sure",
-	})
-	if err != nil {
-		t.Fatalf("evaluate speaker case: %v", err)
-	}
-	if out.PredictedSpeaker != speakerCustomer {
-		t.Fatalf("predicted speaker=%q want=%q", out.PredictedSpeaker, speakerCustomer)
-	}
-}
-
-func TestEmpathyCase_ReturnsConfidenceForSalesRep(t *testing.T) {
-	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		content := mustJSONString(t, map[string]any{
-			"confidence": 0.74,
-		})
-		resp := map[string]any{
-			"choices": []map[string]any{
-				{
-					"message": map[string]any{
-						"content": content,
-						"refusal": "",
-					},
-				},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			t.Fatalf("encode mock response: %v", err)
-		}
-	}))
-	defer mock.Close()
-
-	c := &openAIEmpathyCase{
-		client: &openAIClient{
-			apiKey:  "test_key",
-			baseURL: mock.URL,
-			httpClient: &http.Client{
-				Timeout: 5 * time.Second,
-			},
-		},
-		model: defaultAnnotateModel,
-	}
-
-	out, err := c.Evaluate(context.Background(), EmpathyCaseInput{
-		ReplicaText: "I understand your concern and can help.",
-		SpeakerTrue: speakerSalesRep,
-	})
-	if err != nil {
-		t.Fatalf("evaluate empathy case: %v", err)
-	}
-	if !out.Ran {
-		t.Fatalf("empathy case must run")
-	}
-	if out.Confidence != 0.74 {
-		t.Fatalf("confidence=%v want=0.74", out.Confidence)
-	}
-}
-
-func TestEmpathyCase_SkipsCustomerReplica(t *testing.T) {
-	empathyCase := &countingEmpathyCase{}
+func TestBusinessProcess_FarewellContextOverridesFinalMismatch(t *testing.T) {
 	process := AnnotationBusinessProcess{
-		SpeakerCase: staticSpeakerCase{out: ReplicaCaseResult{
-			PredictedSpeaker: speakerCustomer,
-			Confidence:       0.9,
-			EvidenceQuote:    "Thanks",
+		SpeakerUnit: staticSpeakerUnit{out: SpeakerCaseResult{
+			PredictedSpeaker:              speakerCustomer,
+			PredictedSpeakerConfidence:    0.92,
+			FarewellIsCurrentUtterance:    true,
+			FarewellIsConversationClosing: true,
+			FarewellContextSource:         farewellContextSourceCurrent,
+			SpeakerEvidenceQuote:          "Goodbye!",
+			SpeakerEvidenceIsValid:        true,
 		}},
-		EmpathyCase: empathyCase,
+		EmpathyUnit: staticEmpathyUnit{out: EmpathyCaseResult{
+			EmpathyPresent:         false,
+			EmpathyConfidence:      0.0,
+			EmpathyEvidenceQuote:   "",
+			EmpathyEvidenceIsValid: false,
+		}},
 	}
 
 	out, err := process.Run(context.Background(), ProcessInput{
-		ReplicaText: "Thanks for the call.",
-		PrevText:    "",
-		NextText:    "",
-		SpeakerTrue: speakerCustomer,
+		UtteranceText:      "Goodbye!",
+		PreviousText:       "Thanks, bye.",
+		NextText:           "",
+		GroundTruthSpeaker: speakerSalesRep,
 	})
 	if err != nil {
-		t.Fatalf("run process: %v", err)
+		t.Fatalf("process run: %v", err)
 	}
-	if out.Empathy.Ran {
-		t.Fatalf("empathy should be skipped for customer rows")
+	if out.Speaker.SpeakerIsCorrectRaw {
+		t.Fatalf("speaker_is_correct_raw=true, want false")
 	}
-	if empathyCase.calls != 0 {
-		t.Fatalf("empathy case calls=%d want 0", empathyCase.calls)
+	if !out.Speaker.SpeakerIsCorrectFinal {
+		t.Fatalf("speaker_is_correct_final=false, want true")
+	}
+	if out.Speaker.SpeakerQualityDecision != qualityDecisionFarewellOverride {
+		t.Fatalf("speaker_quality_decision=%q want=%q", out.Speaker.SpeakerQualityDecision, qualityDecisionFarewellOverride)
 	}
 }
 
-func TestBusinessProcess_FarewellContextOverridesMismatch(t *testing.T) {
-	empathyCase := &countingEmpathyCase{}
+func TestBusinessProcess_StrictMismatchWithoutFarewell(t *testing.T) {
 	process := AnnotationBusinessProcess{
-		SpeakerCase: staticSpeakerCase{out: ReplicaCaseResult{
-			PredictedSpeaker:      speakerCustomer,
-			Confidence:            0.93,
-			EvidenceQuote:         "Goodbye!",
-			FarewellUtterance:     true,
-			FarewellContext:       true,
-			FarewellContextSource: farewellContextSourceCurrent,
+		SpeakerUnit: staticSpeakerUnit{out: SpeakerCaseResult{
+			PredictedSpeaker:              speakerCustomer,
+			PredictedSpeakerConfidence:    0.88,
+			FarewellIsCurrentUtterance:    false,
+			FarewellIsConversationClosing: false,
+			FarewellContextSource:         farewellContextSourceNone,
+			SpeakerEvidenceQuote:          "Hello",
+			SpeakerEvidenceIsValid:        true,
 		}},
-		EmpathyCase: empathyCase,
+		EmpathyUnit: staticEmpathyUnit{out: EmpathyCaseResult{}},
 	}
 
 	out, err := process.Run(context.Background(), ProcessInput{
-		ReplicaText: "Goodbye!",
-		PrevText:    "Thanks, bye.",
-		NextText:    "",
-		SpeakerTrue: speakerSalesRep,
+		UtteranceText:      "Hello Sarah, thanks for taking my call.",
+		PreviousText:       "",
+		NextText:           "Hi Mark",
+		GroundTruthSpeaker: speakerSalesRep,
 	})
 	if err != nil {
-		t.Fatalf("run process: %v", err)
+		t.Fatalf("process run: %v", err)
 	}
-	if out.Speaker.PredictedSpeaker != speakerCustomer {
-		t.Fatalf("predicted speaker=%q want=%q", out.Speaker.PredictedSpeaker, speakerCustomer)
+	if out.Speaker.SpeakerIsCorrectRaw {
+		t.Fatalf("speaker_is_correct_raw=true, want false")
 	}
-	if out.Speaker.QualityMismatch {
-		t.Fatalf("quality mismatch must be overridden for farewell context")
+	if out.Speaker.SpeakerIsCorrectFinal {
+		t.Fatalf("speaker_is_correct_final=true, want false")
 	}
-	if out.Speaker.QualityDecision != qualityDecisionFarewellOverride {
-		t.Fatalf("quality decision=%q want=%q", out.Speaker.QualityDecision, qualityDecisionFarewellOverride)
+	if out.Speaker.SpeakerQualityDecision != qualityDecisionStrictMismatch {
+		t.Fatalf("speaker_quality_decision=%q want=%q", out.Speaker.SpeakerQualityDecision, qualityDecisionStrictMismatch)
 	}
 }
 
-func TestBusinessProcess_StrictMismatchWithoutFarewellContext(t *testing.T) {
-	empathyCase := &countingEmpathyCase{}
+func TestBusinessProcess_EmathyRoutingUsesGroundTruthSpeaker(t *testing.T) {
+	empathy := &countingEmpathyUnit{out: EmpathyCaseResult{
+		EmpathyPresent:         true,
+		EmpathyConfidence:      0.7,
+		EmpathyEvidenceQuote:   "I understand",
+		EmpathyEvidenceIsValid: true,
+	}}
 	process := AnnotationBusinessProcess{
-		SpeakerCase: staticSpeakerCase{out: ReplicaCaseResult{
-			PredictedSpeaker:      speakerCustomer,
-			Confidence:            0.91,
-			EvidenceQuote:         "Hello",
-			FarewellUtterance:     false,
-			FarewellContext:       false,
-			FarewellContextSource: farewellContextSourceNone,
+		SpeakerUnit: staticSpeakerUnit{out: SpeakerCaseResult{
+			PredictedSpeaker:              speakerCustomer,
+			PredictedSpeakerConfidence:    0.6,
+			FarewellIsCurrentUtterance:    false,
+			FarewellIsConversationClosing: false,
+			FarewellContextSource:         farewellContextSourceNone,
+			SpeakerEvidenceQuote:          "Thanks",
+			SpeakerEvidenceIsValid:        true,
 		}},
-		EmpathyCase: empathyCase,
+		EmpathyUnit: empathy,
 	}
 
-	out, err := process.Run(context.Background(), ProcessInput{
-		ReplicaText: "Hello Sarah, thanks for taking my call.",
-		PrevText:    "",
-		NextText:    "Hi Mark.",
-		SpeakerTrue: speakerSalesRep,
+	customerOut, err := process.Run(context.Background(), ProcessInput{
+		UtteranceText:      "Thanks",
+		PreviousText:       "",
+		NextText:           "",
+		GroundTruthSpeaker: speakerCustomer,
 	})
 	if err != nil {
-		t.Fatalf("run process: %v", err)
+		t.Fatalf("customer run: %v", err)
 	}
-	if !out.Speaker.QualityMismatch {
-		t.Fatalf("quality mismatch should stay strict when farewell context is false")
+	if customerOut.Empathy.EmpathyApplicable {
+		t.Fatalf("customer empathy_applicable=true, want false")
 	}
-	if out.Speaker.QualityDecision != qualityDecisionStrictMismatch {
-		t.Fatalf("quality decision=%q want=%q", out.Speaker.QualityDecision, qualityDecisionStrictMismatch)
+	if empathy.calls != 0 {
+		t.Fatalf("empathy calls=%d want 0", empathy.calls)
+	}
+
+	salesOut, err := process.Run(context.Background(), ProcessInput{
+		UtteranceText:      "I understand your concern",
+		PreviousText:       "",
+		NextText:           "",
+		GroundTruthSpeaker: speakerSalesRep,
+	})
+	if err != nil {
+		t.Fatalf("sales run: %v", err)
+	}
+	if !salesOut.Empathy.EmpathyApplicable {
+		t.Fatalf("sales empathy_applicable=false, want true")
+	}
+	if empathy.calls != 1 {
+		t.Fatalf("empathy calls=%d want 1", empathy.calls)
 	}
 }
 
-type staticSpeakerCase struct {
-	out ReplicaCaseResult
+type staticSpeakerUnit struct {
+	out SpeakerCaseResult
 }
 
-func (s staticSpeakerCase) Evaluate(context.Context, ReplicaCaseInput) (ReplicaCaseResult, error) {
+func (s staticSpeakerUnit) Evaluate(context.Context, SpeakerCaseInput) (SpeakerCaseResult, error) {
 	return s.out, nil
 }
 
-type countingEmpathyCase struct {
-	calls int
+type staticEmpathyUnit struct {
+	out EmpathyCaseResult
 }
 
-func (c *countingEmpathyCase) Evaluate(context.Context, EmpathyCaseInput) (EmpathyCaseResult, error) {
+func (s staticEmpathyUnit) Evaluate(context.Context, EmpathyCaseInput) (EmpathyCaseResult, error) {
+	return s.out, nil
+}
+
+type countingEmpathyUnit struct {
+	calls int
+	out   EmpathyCaseResult
+}
+
+func (c *countingEmpathyUnit) Evaluate(context.Context, EmpathyCaseInput) (EmpathyCaseResult, error) {
 	c.calls++
-	return EmpathyCaseResult{
-		Ran:            true,
-		EmpathyPresent: true,
-		EmpathyType:    "acknowledgement",
-		Confidence:     0.5,
-		EvidenceQuote:  "x",
-	}, nil
+	return c.out, nil
 }

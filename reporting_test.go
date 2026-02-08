@@ -4,35 +4,58 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestAnalyticsMarkdown_ContainsCoreSections(t *testing.T) {
+func TestAnalyticsMarkdown_ContainsRawFinalAndQualityCounters(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "annotations.db")
 	if err := SetupSQLite(dbPath); err != nil {
 		t.Fatalf("setup sqlite: %v", err)
 	}
 
-	insertSeededAnnotation(t, dbPath, seededAnnotation{
-		ConversationID:    "conv_a",
-		ReplicaID:         1,
-		SpeakerTrue:       speakerSalesRep,
-		SpeakerPredicted:  speakerSalesRep,
-		SpeakerConfidence: 0.92,
-		SpeakerMatch:      1,
-		EmpathyConfidence: 0.86,
-		ReviewStatus:      reviewStatusPending,
-		ReplicaText:       "I understand your concern.",
+	insertSeededAnnotation(t, dbPath, AnnotationRow{
+		ConversationID:                "conv_a",
+		UtteranceIndex:                1,
+		UtteranceText:                 "Hello",
+		GroundTruthSpeaker:            speakerSalesRep,
+		PredictedSpeaker:              speakerSalesRep,
+		PredictedSpeakerConfidence:    0.92,
+		SpeakerIsCorrectRaw:           true,
+		SpeakerIsCorrectFinal:         true,
+		SpeakerQualityDecision:        qualityDecisionStrictMatch,
+		FarewellIsCurrentUtterance:    false,
+		FarewellIsConversationClosing: false,
+		FarewellContextSource:         farewellContextSourceNone,
+		SpeakerEvidenceQuote:          "Hello",
+		SpeakerEvidenceIsValid:        true,
+		EmpathyApplicable:             true,
+		EmpathyPresent:                true,
+		EmpathyConfidence:             0.8,
+		EmpathyEvidenceQuote:          "Hello",
+		EmpathyReviewStatus:           reviewStatusPending,
+		Model:                         "seed_model",
 	})
-	insertSeededAnnotation(t, dbPath, seededAnnotation{
-		ConversationID:    "conv_a",
-		ReplicaID:         2,
-		SpeakerTrue:       speakerCustomer,
-		SpeakerPredicted:  speakerSalesRep,
-		SpeakerConfidence: 0.65,
-		SpeakerMatch:      0,
-		EmpathyConfidence: 0,
-		ReviewStatus:      reviewStatusPending,
-		ReplicaText:       "Bye.",
+	insertSeededAnnotation(t, dbPath, AnnotationRow{
+		ConversationID:                "conv_a",
+		UtteranceIndex:                2,
+		UtteranceText:                 "Goodbye!",
+		GroundTruthSpeaker:            speakerSalesRep,
+		PredictedSpeaker:              speakerCustomer,
+		PredictedSpeakerConfidence:    0.81,
+		SpeakerIsCorrectRaw:           false,
+		SpeakerIsCorrectFinal:         true,
+		SpeakerQualityDecision:        qualityDecisionFarewellOverride,
+		FarewellIsCurrentUtterance:    true,
+		FarewellIsConversationClosing: true,
+		FarewellContextSource:         farewellContextSourceCurrent,
+		SpeakerEvidenceQuote:          "",
+		SpeakerEvidenceIsValid:        false,
+		EmpathyApplicable:             true,
+		EmpathyPresent:                false,
+		EmpathyConfidence:             0.4,
+		EmpathyEvidenceQuote:          "",
+		EmpathyReviewStatus:           reviewStatusPending,
+		Model:                         "seed_model",
 	})
 
 	md, err := BuildAnalyticsMarkdown(dbPath)
@@ -40,36 +63,100 @@ func TestAnalyticsMarkdown_ContainsCoreSections(t *testing.T) {
 		t.Fatalf("build analytics markdown: %v", err)
 	}
 
-	for _, section := range []string{
-		"# Analytics",
-		"## Totals",
-		"## Speaker Accuracy",
-		"## Empathy Confidence",
-		"## Manual Review",
-		"## Short-Utterance Speaker Mismatches",
+	for _, token := range []string{
+		"speaker_accuracy_raw_percent",
+		"speaker_accuracy_final_percent",
+		"farewell_override_count",
+		"speaker_evidence_invalid_count",
+		"empathy_review_pending_applicable",
 	} {
-		if !strings.Contains(md, section) {
-			t.Fatalf("analytics markdown missing %q", section)
+		if !strings.Contains(md, token) {
+			t.Fatalf("analytics markdown missing %q", token)
 		}
 	}
 }
 
-func TestDebugMarkdown_ContainsRedConversations(t *testing.T) {
+func TestBuildReport_PendingReviewCountsOnlyApplicableRows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "annotations.db")
 	if err := SetupSQLite(dbPath); err != nil {
 		t.Fatalf("setup sqlite: %v", err)
 	}
 
-	insertSeededAnnotation(t, dbPath, seededAnnotation{
-		ConversationID:    "conv_bad",
-		ReplicaID:         1,
-		SpeakerTrue:       speakerSalesRep,
-		SpeakerPredicted:  speakerCustomer,
-		SpeakerConfidence: 0.90,
-		SpeakerMatch:      0,
-		EmpathyConfidence: 0.73,
-		ReviewStatus:      reviewStatusPending,
-		ReplicaText:       "Goodbye.",
+	insertSeededAnnotation(t, dbPath, AnnotationRow{
+		ConversationID:             "conv_a",
+		UtteranceIndex:             1,
+		UtteranceText:              "Sales row",
+		GroundTruthSpeaker:         speakerSalesRep,
+		PredictedSpeaker:           speakerSalesRep,
+		PredictedSpeakerConfidence: 0.9,
+		SpeakerIsCorrectRaw:        true,
+		SpeakerIsCorrectFinal:      true,
+		SpeakerQualityDecision:     qualityDecisionStrictMatch,
+		FarewellContextSource:      farewellContextSourceNone,
+		SpeakerEvidenceQuote:       "Sales",
+		SpeakerEvidenceIsValid:     true,
+		EmpathyApplicable:          true,
+		EmpathyPresent:             true,
+		EmpathyConfidence:          0.7,
+		EmpathyEvidenceQuote:       "Sales",
+		EmpathyReviewStatus:        reviewStatusPending,
+		Model:                      "seed_model",
+	})
+	insertSeededAnnotation(t, dbPath, AnnotationRow{
+		ConversationID:             "conv_b",
+		UtteranceIndex:             1,
+		UtteranceText:              "Customer row",
+		GroundTruthSpeaker:         speakerCustomer,
+		PredictedSpeaker:           speakerCustomer,
+		PredictedSpeakerConfidence: 0.88,
+		SpeakerIsCorrectRaw:        true,
+		SpeakerIsCorrectFinal:      true,
+		SpeakerQualityDecision:     qualityDecisionStrictMatch,
+		FarewellContextSource:      farewellContextSourceNone,
+		SpeakerEvidenceQuote:       "Customer",
+		SpeakerEvidenceIsValid:     true,
+		EmpathyApplicable:          false,
+		EmpathyPresent:             false,
+		EmpathyConfidence:          0,
+		EmpathyEvidenceQuote:       "",
+		EmpathyReviewStatus:        reviewStatusNotApplicable,
+		Model:                      "seed_model",
+	})
+
+	report, err := BuildReport(dbPath)
+	if err != nil {
+		t.Fatalf("build report: %v", err)
+	}
+	if report.EmpathyReviewPendingCount != 1 {
+		t.Fatalf("pending applicable=%d want=1", report.EmpathyReviewPendingCount)
+	}
+}
+
+func TestDebugMarkdown_ContainsRawAndFinalSections(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+
+	insertSeededAnnotation(t, dbPath, AnnotationRow{
+		ConversationID:             "conv_bad",
+		UtteranceIndex:             1,
+		UtteranceText:              "Hello",
+		GroundTruthSpeaker:         speakerSalesRep,
+		PredictedSpeaker:           speakerCustomer,
+		PredictedSpeakerConfidence: 0.8,
+		SpeakerIsCorrectRaw:        false,
+		SpeakerIsCorrectFinal:      false,
+		SpeakerQualityDecision:     qualityDecisionStrictMismatch,
+		FarewellContextSource:      farewellContextSourceNone,
+		SpeakerEvidenceQuote:       "Hello",
+		SpeakerEvidenceIsValid:     true,
+		EmpathyApplicable:          true,
+		EmpathyPresent:             false,
+		EmpathyConfidence:          0.3,
+		EmpathyEvidenceQuote:       "Hello",
+		EmpathyReviewStatus:        reviewStatusPending,
+		Model:                      "seed_model",
 	})
 
 	md, err := BuildReleaseDebugMarkdown(dbPath)
@@ -77,72 +164,33 @@ func TestDebugMarkdown_ContainsRedConversations(t *testing.T) {
 		t.Fatalf("build debug markdown: %v", err)
 	}
 
-	for _, item := range []string{
-		"## Red Conversations",
-		"conv_bad",
-		"speaker_mismatch",
+	for _, token := range []string{
+		"Red Conversations (Raw)",
+		"Red Conversations (Final)",
+		"Top Raw Mismatches",
+		"Top Evidence Invalid",
 	} {
-		if !strings.Contains(md, item) {
-			t.Fatalf("debug markdown missing %q", item)
+		if !strings.Contains(md, token) {
+			t.Fatalf("debug markdown missing %q", token)
 		}
 	}
 }
 
-func TestReport_ConsoleSummaryContainsManualReviewStats(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "annotations.db")
-	if err := SetupSQLite(dbPath); err != nil {
-		t.Fatalf("setup sqlite: %v", err)
-	}
-
-	insertSeededAnnotation(t, dbPath, seededAnnotation{
-		ConversationID:    "conv_a",
-		ReplicaID:         1,
-		SpeakerTrue:       speakerSalesRep,
-		SpeakerPredicted:  speakerSalesRep,
-		SpeakerConfidence: 0.88,
-		SpeakerMatch:      1,
-		EmpathyConfidence: 0.80,
-		ReviewStatus:      reviewStatusPending,
-		ReplicaText:       "I hear you.",
-	})
-	insertSeededAnnotation(t, dbPath, seededAnnotation{
-		ConversationID:    "conv_a",
-		ReplicaID:         2,
-		SpeakerTrue:       speakerSalesRep,
-		SpeakerPredicted:  speakerSalesRep,
-		SpeakerConfidence: 0.84,
-		SpeakerMatch:      1,
-		EmpathyConfidence: 0.76,
-		ReviewStatus:      reviewStatusOK,
-		ReplicaText:       "Let's solve this.",
-	})
-	insertSeededAnnotation(t, dbPath, seededAnnotation{
-		ConversationID:    "conv_b",
-		ReplicaID:         1,
-		SpeakerTrue:       speakerSalesRep,
-		SpeakerPredicted:  speakerCustomer,
-		SpeakerConfidence: 0.70,
-		SpeakerMatch:      0,
-		EmpathyConfidence: 0.61,
-		ReviewStatus:      reviewStatusNotOK,
-		ReviewerNote:      "Not empathetic enough.",
-		ReplicaText:       "Thanks.",
-	})
-
-	report, err := BuildReport(dbPath)
+func insertSeededAnnotation(t *testing.T, dbPath string, row AnnotationRow) {
+	t.Helper()
+	store, err := OpenSQLiteStore(dbPath)
 	if err != nil {
-		t.Fatalf("build report: %v", err)
+		t.Fatalf("open sqlite store: %v", err)
 	}
-	text := FormatReport(report)
+	defer store.Close()
 
-	for _, token := range []string{
-		"speaker_accuracy_percent=",
-		"empathy_review_pending=",
-		"empathy_review_ok=",
-		"empathy_review_not_ok=",
-	} {
-		if !strings.Contains(text, token) {
-			t.Fatalf("report output missing %q", token)
-		}
+	if strings.TrimSpace(row.AnnotatedAtUTC) == "" {
+		row.AnnotatedAtUTC = time.Now().UTC().Format(time.RFC3339)
+	}
+	if strings.TrimSpace(row.Model) == "" {
+		row.Model = "seed_model"
+	}
+	if err := store.InsertAnnotation(row); err != nil {
+		t.Fatalf("insert seeded annotation: %v", err)
 	}
 }

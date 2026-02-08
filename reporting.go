@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,49 +11,54 @@ type reportMetrics struct {
 	TotalRows          int
 	TotalConversations int
 
-	SpeakerMatchCount      int
-	SpeakerAccuracyPercent float64
-	GreenReplicaCount      int
-	RedReplicaCount        int
-	GreenReplicaPercent    float64
-	RedReplicaPercent      float64
-	GreenConversationCount int
-	RedConversationCount   int
-	GreenConversationPct   float64
-	RedConversationPct     float64
+	SpeakerCorrectRawCount      int
+	SpeakerCorrectFinalCount    int
+	SpeakerAccuracyRawPercent   float64
+	SpeakerAccuracyFinalPercent float64
+	RawMismatchCount            int
+	FinalMismatchCount          int
+	FarewellOverrideCount       int
+	SpeakerEvidenceInvalidCount int
 
+	EmpathyApplicableCount    int
 	EmpathyConfidenceAvg      float64
 	EmpathyConfidenceMin      float64
 	EmpathyConfidenceMax      float64
-	EmpathyConfidenceGTE70    int
-	EmpathyConfidenceRowCount int
+	EmpathyReviewPendingCount int
+	EmpathyReviewOKCount      int
+	EmpathyReviewNotOKCount   int
 
-	ReviewPendingCount int
-	ReviewOKCount      int
-	ReviewNotOKCount   int
+	LLMEventCount            int
+	LLMParseFailedCount      int
+	LLMValidationFailedCount int
 
-	RedConversations         []conversationDebugItem
-	ShortUtteranceMismatches []shortUtteranceMismatch
-	NotOKItems               []empathyReviewItem
+	RawRedConversations   []conversationDebugItem
+	FinalRedConversations []conversationDebugItem
+	TopRawMismatches      []utteranceDebugItem
+	TopFinalMismatches    []utteranceDebugItem
+	TopEvidenceInvalid    []utteranceDebugItem
+	TopShortUtterances    []utteranceDebugItem
+	NotOKItems            []empathyReviewItem
 }
 
 type conversationDebugItem struct {
 	ConversationID string
-	RedReplicas    int
-	TotalReplicas  int
+	RedRows        int
+	TotalRows      int
 	TopReason      string
 }
 
-type shortUtteranceMismatch struct {
-	ConversationID string
-	ReplicaID      int
-	ReplicaText    string
-	TextLength     int
+type utteranceDebugItem struct {
+	ConversationID         string
+	UtteranceIndex         int
+	UtteranceText          string
+	TextLength             int
+	SpeakerQualityDecision string
 }
 
 type empathyReviewItem struct {
 	ConversationID      string
-	ReplicaID           int
+	UtteranceIndex      int
 	EmpathyConfidence   float64
 	EmpathyReviewerNote string
 }
@@ -63,20 +69,23 @@ func BuildReport(dbPath string) (reportMetrics, error) {
 		return reportMetrics{}, err
 	}
 	defer db.Close()
-	if err := ensureAnnotationsSchema(db); err != nil {
+	if err := ensureStoreSchema(db); err != nil {
 		return reportMetrics{}, err
 	}
 
 	rows, err := db.Query(`
 		SELECT
 			conversation_id,
-			replica_id,
-			speaker_match,
-			speaker_true,
+			utterance_index,
+			speaker_is_correct_raw,
+			speaker_is_correct_final,
+			speaker_quality_decision,
+			speaker_evidence_is_valid,
+			empathy_applicable,
 			empathy_confidence,
 			empathy_review_status,
 			empathy_reviewer_note,
-			replica_text
+			utterance_text
 		FROM annotations
 	`)
 	if err != nil {
@@ -85,8 +94,9 @@ func BuildReport(dbPath string) (reportMetrics, error) {
 	defer rows.Close()
 
 	type convState struct {
-		Total int
-		Red   int
+		Total    int
+		RawRed   int
+		FinalRed int
 	}
 	conversations := map[string]*convState{}
 
@@ -94,58 +104,88 @@ func BuildReport(dbPath string) (reportMetrics, error) {
 	hasEmpathy := false
 	for rows.Next() {
 		var conversationID string
-		var replicaID int
-		var speakerMatch int
-		var speakerTrue string
+		var utteranceIndex int
+		var rawCorrect int
+		var finalCorrect int
+		var qualityDecision string
+		var speakerEvidenceValid int
+		var empathyApplicable int
 		var empathyConfidence float64
-		var reviewStatus string
-		var reviewerNote string
-		var replicaText string
+		var empathyReviewStatus string
+		var empathyReviewerNote string
+		var utteranceText string
 		if err := rows.Scan(
 			&conversationID,
-			&replicaID,
-			&speakerMatch,
-			&speakerTrue,
+			&utteranceIndex,
+			&rawCorrect,
+			&finalCorrect,
+			&qualityDecision,
+			&speakerEvidenceValid,
+			&empathyApplicable,
 			&empathyConfidence,
-			&reviewStatus,
-			&reviewerNote,
-			&replicaText,
+			&empathyReviewStatus,
+			&empathyReviewerNote,
+			&utteranceText,
 		); err != nil {
 			return reportMetrics{}, fmt.Errorf("scan annotation row: %w", err)
 		}
 
 		report.TotalRows++
-		if speakerMatch == 1 {
-			report.SpeakerMatchCount++
-			report.GreenReplicaCount++
+		if rawCorrect == 1 {
+			report.SpeakerCorrectRawCount++
 		} else {
-			report.RedReplicaCount++
-			replicaText = strings.TrimSpace(replicaText)
-			textLen := len([]rune(replicaText))
-			if textLen <= shortUtteranceMaxLen {
-				report.ShortUtteranceMismatches = append(report.ShortUtteranceMismatches, shortUtteranceMismatch{
-					ConversationID: conversationID,
-					ReplicaID:      replicaID,
-					ReplicaText:    replicaText,
-					TextLength:     textLen,
-				})
+			report.RawMismatchCount++
+		}
+		if finalCorrect == 1 {
+			report.SpeakerCorrectFinalCount++
+		} else {
+			report.FinalMismatchCount++
+		}
+		if strings.TrimSpace(qualityDecision) == qualityDecisionFarewellOverride {
+			report.FarewellOverrideCount++
+		}
+		if speakerEvidenceValid == 0 {
+			report.SpeakerEvidenceInvalidCount++
+		}
+
+		text := strings.TrimSpace(utteranceText)
+		item := utteranceDebugItem{
+			ConversationID:         conversationID,
+			UtteranceIndex:         utteranceIndex,
+			UtteranceText:          text,
+			TextLength:             len([]rune(text)),
+			SpeakerQualityDecision: strings.TrimSpace(qualityDecision),
+		}
+		if rawCorrect == 0 {
+			report.TopRawMismatches = append(report.TopRawMismatches, item)
+			if item.TextLength <= shortUtteranceMaxLen {
+				report.TopShortUtterances = append(report.TopShortUtterances, item)
 			}
 		}
-
-		s := conversations[conversationID]
-		if s == nil {
-			s = &convState{}
-			conversations[conversationID] = s
+		if finalCorrect == 0 {
+			report.TopFinalMismatches = append(report.TopFinalMismatches, item)
 		}
-		s.Total++
-		if speakerMatch == 0 {
-			s.Red++
+		if speakerEvidenceValid == 0 {
+			report.TopEvidenceInvalid = append(report.TopEvidenceInvalid, item)
 		}
 
-		if canonicalSpeakerLabel(speakerTrue) == speakerSalesRep {
+		state := conversations[conversationID]
+		if state == nil {
+			state = &convState{}
+			conversations[conversationID] = state
+		}
+		state.Total++
+		if rawCorrect == 0 {
+			state.RawRed++
+		}
+		if finalCorrect == 0 {
+			state.FinalRed++
+		}
+
+		if empathyApplicable == 1 {
+			report.EmpathyApplicableCount++
 			hasEmpathy = true
-			report.EmpathyConfidenceRowCount++
-			if report.EmpathyConfidenceRowCount == 1 {
+			if report.EmpathyApplicableCount == 1 {
 				report.EmpathyConfidenceMin = empathyConfidence
 				report.EmpathyConfidenceMax = empathyConfidence
 			}
@@ -156,24 +196,21 @@ func BuildReport(dbPath string) (reportMetrics, error) {
 				report.EmpathyConfidenceMax = empathyConfidence
 			}
 			report.EmpathyConfidenceAvg += empathyConfidence
-			if empathyConfidence >= 0.70 {
-				report.EmpathyConfidenceGTE70++
-			}
-		}
 
-		switch strings.TrimSpace(reviewStatus) {
-		case reviewStatusOK:
-			report.ReviewOKCount++
-		case reviewStatusNotOK:
-			report.ReviewNotOKCount++
-			report.NotOKItems = append(report.NotOKItems, empathyReviewItem{
-				ConversationID:      conversationID,
-				ReplicaID:           replicaID,
-				EmpathyConfidence:   empathyConfidence,
-				EmpathyReviewerNote: strings.TrimSpace(reviewerNote),
-			})
-		default:
-			report.ReviewPendingCount++
+			switch strings.TrimSpace(empathyReviewStatus) {
+			case reviewStatusOK:
+				report.EmpathyReviewOKCount++
+			case reviewStatusNotOK:
+				report.EmpathyReviewNotOKCount++
+				report.NotOKItems = append(report.NotOKItems, empathyReviewItem{
+					ConversationID:      conversationID,
+					UtteranceIndex:      utteranceIndex,
+					EmpathyConfidence:   empathyConfidence,
+					EmpathyReviewerNote: strings.TrimSpace(empathyReviewerNote),
+				})
+			default:
+				report.EmpathyReviewPendingCount++
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -181,65 +218,116 @@ func BuildReport(dbPath string) (reportMetrics, error) {
 	}
 
 	report.TotalConversations = len(conversations)
-	for conversationID, s := range conversations {
-		if s.Red == 0 {
-			report.GreenConversationCount++
-		} else {
-			report.RedConversationCount++
-			report.RedConversations = append(report.RedConversations, conversationDebugItem{
+	for conversationID, state := range conversations {
+		if state.RawRed > 0 {
+			report.RawRedConversations = append(report.RawRedConversations, conversationDebugItem{
 				ConversationID: conversationID,
-				RedReplicas:    s.Red,
-				TotalReplicas:  s.Total,
-				TopReason:      fmt.Sprintf("speaker_mismatch (%d)", s.Red),
+				RedRows:        state.RawRed,
+				TotalRows:      state.Total,
+				TopReason:      fmt.Sprintf("raw_speaker_mismatch (%d)", state.RawRed),
+			})
+		}
+		if state.FinalRed > 0 {
+			report.FinalRedConversations = append(report.FinalRedConversations, conversationDebugItem{
+				ConversationID: conversationID,
+				RedRows:        state.FinalRed,
+				TotalRows:      state.Total,
+				TopReason:      fmt.Sprintf("final_speaker_mismatch (%d)", state.FinalRed),
 			})
 		}
 	}
 
 	if report.TotalRows > 0 {
-		report.SpeakerAccuracyPercent = 100.0 * float64(report.SpeakerMatchCount) / float64(report.TotalRows)
-		report.GreenReplicaPercent = 100.0 * float64(report.GreenReplicaCount) / float64(report.TotalRows)
-		report.RedReplicaPercent = 100.0 * float64(report.RedReplicaCount) / float64(report.TotalRows)
+		report.SpeakerAccuracyRawPercent = 100.0 * float64(report.SpeakerCorrectRawCount) / float64(report.TotalRows)
+		report.SpeakerAccuracyFinalPercent = 100.0 * float64(report.SpeakerCorrectFinalCount) / float64(report.TotalRows)
 	}
-	if report.TotalConversations > 0 {
-		report.GreenConversationPct = 100.0 * float64(report.GreenConversationCount) / float64(report.TotalConversations)
-		report.RedConversationPct = 100.0 * float64(report.RedConversationCount) / float64(report.TotalConversations)
-	}
-	if hasEmpathy && report.EmpathyConfidenceRowCount > 0 {
-		report.EmpathyConfidenceAvg = report.EmpathyConfidenceAvg / float64(report.EmpathyConfidenceRowCount)
+	if hasEmpathy && report.EmpathyApplicableCount > 0 {
+		report.EmpathyConfidenceAvg = report.EmpathyConfidenceAvg / float64(report.EmpathyApplicableCount)
 	}
 
-	sort.Slice(report.RedConversations, func(i, j int) bool {
-		if report.RedConversations[i].RedReplicas == report.RedConversations[j].RedReplicas {
-			return report.RedConversations[i].ConversationID < report.RedConversations[j].ConversationID
-		}
-		return report.RedConversations[i].RedReplicas > report.RedConversations[j].RedReplicas
-	})
-	sort.Slice(report.ShortUtteranceMismatches, func(i, j int) bool {
-		if report.ShortUtteranceMismatches[i].TextLength == report.ShortUtteranceMismatches[j].TextLength {
-			if report.ShortUtteranceMismatches[i].ConversationID == report.ShortUtteranceMismatches[j].ConversationID {
-				return report.ShortUtteranceMismatches[i].ReplicaID < report.ShortUtteranceMismatches[j].ReplicaID
-			}
-			return report.ShortUtteranceMismatches[i].ConversationID < report.ShortUtteranceMismatches[j].ConversationID
-		}
-		return report.ShortUtteranceMismatches[i].TextLength < report.ShortUtteranceMismatches[j].TextLength
-	})
-	if len(report.ShortUtteranceMismatches) > 10 {
-		report.ShortUtteranceMismatches = report.ShortUtteranceMismatches[:10]
+	if err := fillLLMEventMetrics(db, &report); err != nil {
+		return reportMetrics{}, err
 	}
-	sort.Slice(report.NotOKItems, func(i, j int) bool {
-		if report.NotOKItems[i].EmpathyConfidence == report.NotOKItems[j].EmpathyConfidence {
-			if report.NotOKItems[i].ConversationID == report.NotOKItems[j].ConversationID {
-				return report.NotOKItems[i].ReplicaID < report.NotOKItems[j].ReplicaID
-			}
-			return report.NotOKItems[i].ConversationID < report.NotOKItems[j].ConversationID
-		}
-		return report.NotOKItems[i].EmpathyConfidence > report.NotOKItems[j].EmpathyConfidence
-	})
+
+	sortConversationItems(report.RawRedConversations)
+	sortConversationItems(report.FinalRedConversations)
+	sortUtteranceItems(report.TopRawMismatches)
+	sortUtteranceItems(report.TopFinalMismatches)
+	sortUtteranceItems(report.TopEvidenceInvalid)
+	sortUtteranceItems(report.TopShortUtterances)
+	sortNotOKItems(report.NotOKItems)
+
+	report.TopRawMismatches = trimUtteranceItems(report.TopRawMismatches, 10)
+	report.TopFinalMismatches = trimUtteranceItems(report.TopFinalMismatches, 10)
+	report.TopEvidenceInvalid = trimUtteranceItems(report.TopEvidenceInvalid, 10)
+	report.TopShortUtterances = trimUtteranceItems(report.TopShortUtterances, 10)
 	if len(report.NotOKItems) > 20 {
 		report.NotOKItems = report.NotOKItems[:20]
 	}
 
 	return report, nil
+}
+
+func fillLLMEventMetrics(db *sql.DB, report *reportMetrics) error {
+	if report == nil {
+		return nil
+	}
+	var parseFailed int
+	var validationFailed int
+	var total int
+	if err := db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN parse_ok = 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN validation_ok = 0 THEN 1 ELSE 0 END), 0)
+		FROM llm_events
+	`).Scan(&total, &parseFailed, &validationFailed); err != nil {
+		return fmt.Errorf("query llm event metrics: %w", err)
+	}
+	report.LLMEventCount = total
+	report.LLMParseFailedCount = parseFailed
+	report.LLMValidationFailedCount = validationFailed
+	return nil
+}
+
+func sortConversationItems(items []conversationDebugItem) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].RedRows == items[j].RedRows {
+			return items[i].ConversationID < items[j].ConversationID
+		}
+		return items[i].RedRows > items[j].RedRows
+	})
+}
+
+func sortUtteranceItems(items []utteranceDebugItem) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].TextLength == items[j].TextLength {
+			if items[i].ConversationID == items[j].ConversationID {
+				return items[i].UtteranceIndex < items[j].UtteranceIndex
+			}
+			return items[i].ConversationID < items[j].ConversationID
+		}
+		return items[i].TextLength < items[j].TextLength
+	})
+}
+
+func sortNotOKItems(items []empathyReviewItem) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].EmpathyConfidence == items[j].EmpathyConfidence {
+			if items[i].ConversationID == items[j].ConversationID {
+				return items[i].UtteranceIndex < items[j].UtteranceIndex
+			}
+			return items[i].ConversationID < items[j].ConversationID
+		}
+		return items[i].EmpathyConfidence > items[j].EmpathyConfidence
+	})
+}
+
+func trimUtteranceItems(items []utteranceDebugItem, max int) []utteranceDebugItem {
+	if len(items) <= max {
+		return items
+	}
+	return items[:max]
 }
 
 func BuildAnalyticsMarkdown(dbPath string) (string, error) {
@@ -252,38 +340,29 @@ func BuildAnalyticsMarkdown(dbPath string) (string, error) {
 	b.WriteString("# Analytics\n\n")
 	b.WriteString("## Totals\n")
 	b.WriteString(fmt.Sprintf("- total_rows: `%d`\n", report.TotalRows))
-	b.WriteString(fmt.Sprintf("- total_conversations: `%d`\n", report.TotalConversations))
-	b.WriteString(fmt.Sprintf("- green_replicas: `%d` (%.2f%%)\n", report.GreenReplicaCount, report.GreenReplicaPercent))
-	b.WriteString(fmt.Sprintf("- red_replicas: `%d` (%.2f%%)\n\n", report.RedReplicaCount, report.RedReplicaPercent))
+	b.WriteString(fmt.Sprintf("- total_conversations: `%d`\n\n", report.TotalConversations))
 
-	b.WriteString("## Speaker Accuracy\n")
-	b.WriteString(fmt.Sprintf("- speaker_accuracy_percent: `%.2f%%` (`%d/%d`)\n\n", report.SpeakerAccuracyPercent, report.SpeakerMatchCount, report.TotalRows))
+	b.WriteString("## Speaker Quality\n")
+	b.WriteString(fmt.Sprintf("- speaker_accuracy_raw_percent: `%.2f%%` (`%d/%d`)\n", report.SpeakerAccuracyRawPercent, report.SpeakerCorrectRawCount, report.TotalRows))
+	b.WriteString(fmt.Sprintf("- speaker_accuracy_final_percent: `%.2f%%` (`%d/%d`)\n", report.SpeakerAccuracyFinalPercent, report.SpeakerCorrectFinalCount, report.TotalRows))
+	b.WriteString(fmt.Sprintf("- raw_mismatch_count: `%d`\n", report.RawMismatchCount))
+	b.WriteString(fmt.Sprintf("- final_mismatch_count: `%d`\n", report.FinalMismatchCount))
+	b.WriteString(fmt.Sprintf("- farewell_override_count: `%d`\n", report.FarewellOverrideCount))
+	b.WriteString(fmt.Sprintf("- speaker_evidence_invalid_count: `%d`\n\n", report.SpeakerEvidenceInvalidCount))
 
-	b.WriteString("## Empathy Confidence\n")
-	b.WriteString(fmt.Sprintf("- sales_rep_rows: `%d`\n", report.EmpathyConfidenceRowCount))
-	b.WriteString(fmt.Sprintf("- avg_confidence: `%.4f`\n", report.EmpathyConfidenceAvg))
-	b.WriteString(fmt.Sprintf("- min_confidence: `%.4f`\n", report.EmpathyConfidenceMin))
-	b.WriteString(fmt.Sprintf("- max_confidence: `%.4f`\n", report.EmpathyConfidenceMax))
-	b.WriteString(fmt.Sprintf("- confidence_gte_0_70_count: `%d`\n\n", report.EmpathyConfidenceGTE70))
+	b.WriteString("## Empathy\n")
+	b.WriteString(fmt.Sprintf("- empathy_applicable_rows: `%d`\n", report.EmpathyApplicableCount))
+	b.WriteString(fmt.Sprintf("- empathy_confidence_avg: `%.4f`\n", report.EmpathyConfidenceAvg))
+	b.WriteString(fmt.Sprintf("- empathy_confidence_min: `%.4f`\n", report.EmpathyConfidenceMin))
+	b.WriteString(fmt.Sprintf("- empathy_confidence_max: `%.4f`\n", report.EmpathyConfidenceMax))
+	b.WriteString(fmt.Sprintf("- empathy_review_pending_applicable: `%d`\n", report.EmpathyReviewPendingCount))
+	b.WriteString(fmt.Sprintf("- empathy_review_ok: `%d`\n", report.EmpathyReviewOKCount))
+	b.WriteString(fmt.Sprintf("- empathy_review_not_ok: `%d`\n\n", report.EmpathyReviewNotOKCount))
 
-	b.WriteString("## Manual Review\n")
-	b.WriteString(fmt.Sprintf("- pending: `%d`\n", report.ReviewPendingCount))
-	b.WriteString(fmt.Sprintf("- ok: `%d`\n", report.ReviewOKCount))
-	b.WriteString(fmt.Sprintf("- not_ok: `%d`\n\n", report.ReviewNotOKCount))
-
-	b.WriteString("## Short-Utterance Speaker Mismatches\n")
-	if len(report.ShortUtteranceMismatches) == 0 {
-		b.WriteString("- none\n")
-	} else {
-		for _, item := range report.ShortUtteranceMismatches {
-			b.WriteString(fmt.Sprintf("- `%s` / replica `%d` / len `%d`: `%s`\n",
-				item.ConversationID,
-				item.ReplicaID,
-				item.TextLength,
-				item.ReplicaText,
-			))
-		}
-	}
+	b.WriteString("## LLM Events\n")
+	b.WriteString(fmt.Sprintf("- llm_event_rows: `%d`\n", report.LLMEventCount))
+	b.WriteString(fmt.Sprintf("- llm_parse_failed_count: `%d`\n", report.LLMParseFailedCount))
+	b.WriteString(fmt.Sprintf("- llm_validation_failed_count: `%d`\n", report.LLMValidationFailedCount))
 	return b.String(), nil
 }
 
@@ -296,74 +375,81 @@ func BuildReleaseDebugMarkdown(dbPath string) (string, error) {
 	var b strings.Builder
 	b.WriteString("# Release Debug\n\n")
 	b.WriteString("## Summary\n")
-	b.WriteString(fmt.Sprintf("- green replicas: `%d` (%.2f%%)\n", report.GreenReplicaCount, report.GreenReplicaPercent))
-	b.WriteString(fmt.Sprintf("- red replicas: `%d` (%.2f%%)\n", report.RedReplicaCount, report.RedReplicaPercent))
-	b.WriteString(fmt.Sprintf("- green conversations: `%d` (%.2f%%)\n", report.GreenConversationCount, report.GreenConversationPct))
-	b.WriteString(fmt.Sprintf("- red conversations: `%d` (%.2f%%)\n\n", report.RedConversationCount, report.RedConversationPct))
+	b.WriteString(fmt.Sprintf("- total_rows: `%d`\n", report.TotalRows))
+	b.WriteString(fmt.Sprintf("- raw_mismatch_count: `%d`\n", report.RawMismatchCount))
+	b.WriteString(fmt.Sprintf("- final_mismatch_count: `%d`\n", report.FinalMismatchCount))
+	b.WriteString(fmt.Sprintf("- farewell_override_count: `%d`\n", report.FarewellOverrideCount))
+	b.WriteString(fmt.Sprintf("- speaker_evidence_invalid_count: `%d`\n\n", report.SpeakerEvidenceInvalidCount))
 
-	b.WriteString("## Red Conversations\n")
-	if len(report.RedConversations) == 0 {
+	b.WriteString("## Red Conversations (Raw)\n")
+	if len(report.RawRedConversations) == 0 {
 		b.WriteString("- none\n\n")
 	} else {
-		b.WriteString("| conversation_id | red_replicas | total_replicas | top_reason |\n")
+		b.WriteString("| conversation_id | raw_red_rows | total_rows | top_reason |\n")
 		b.WriteString("| --- | ---: | ---: | --- |\n")
-		for _, item := range report.RedConversations {
-			b.WriteString(fmt.Sprintf("| `%s` | `%d` | `%d` | %s |\n", item.ConversationID, item.RedReplicas, item.TotalReplicas, item.TopReason))
+		for _, item := range report.RawRedConversations {
+			b.WriteString(fmt.Sprintf("| `%s` | `%d` | `%d` | %s |\n", item.ConversationID, item.RedRows, item.TotalRows, item.TopReason))
 		}
 		b.WriteString("\n")
 	}
 
-	b.WriteString("## Empathy Review Backlog\n")
-	b.WriteString(fmt.Sprintf("- pending_count: `%d`\n", report.ReviewPendingCount))
-	b.WriteString(fmt.Sprintf("- not_ok_count: `%d`\n\n", report.ReviewNotOKCount))
-
-	b.WriteString("## Not-OK Empathy Rows\n")
-	if len(report.NotOKItems) == 0 {
+	b.WriteString("## Red Conversations (Final)\n")
+	if len(report.FinalRedConversations) == 0 {
 		b.WriteString("- none\n\n")
 	} else {
-		b.WriteString("| conversation_id | replica_id | empathy_confidence | reviewer_note |\n")
+		b.WriteString("| conversation_id | final_red_rows | total_rows | top_reason |\n")
 		b.WriteString("| --- | ---: | ---: | --- |\n")
-		for _, item := range report.NotOKItems {
-			b.WriteString(fmt.Sprintf("| `%s` | `%d` | `%.4f` | `%s` |\n",
-				item.ConversationID,
-				item.ReplicaID,
-				item.EmpathyConfidence,
-				strings.ReplaceAll(item.EmpathyReviewerNote, "`", "'"),
-			))
+		for _, item := range report.FinalRedConversations {
+			b.WriteString(fmt.Sprintf("| `%s` | `%d` | `%d` | %s |\n", item.ConversationID, item.RedRows, item.TotalRows, item.TopReason))
 		}
 		b.WriteString("\n")
 	}
 
-	b.WriteString("## Top Short-Utterance Mismatches\n")
-	if len(report.ShortUtteranceMismatches) == 0 {
-		b.WriteString("- none\n")
-	} else {
-		b.WriteString("| conversation_id | replica_id | text_length | replica_text |\n")
-		b.WriteString("| --- | ---: | ---: | --- |\n")
-		for _, item := range report.ShortUtteranceMismatches {
-			b.WriteString(fmt.Sprintf("| `%s` | `%d` | `%d` | `%s` |\n",
-				item.ConversationID,
-				item.ReplicaID,
-				item.TextLength,
-				strings.ReplaceAll(item.ReplicaText, "`", "'"),
-			))
-		}
-	}
+	b.WriteString("## Top Raw Mismatches\n")
+	writeUtteranceTable(&b, report.TopRawMismatches)
+	b.WriteString("\n## Top Final Mismatches\n")
+	writeUtteranceTable(&b, report.TopFinalMismatches)
+	b.WriteString("\n## Top Evidence Invalid\n")
+	writeUtteranceTable(&b, report.TopEvidenceInvalid)
+	b.WriteString("\n## Top Short-Utterance Raw Mismatches\n")
+	writeUtteranceTable(&b, report.TopShortUtterances)
 
+	b.WriteString("\n## LLM Event Failures\n")
+	b.WriteString(fmt.Sprintf("- parse_failed: `%d`\n", report.LLMParseFailedCount))
+	b.WriteString(fmt.Sprintf("- validation_failed: `%d`\n", report.LLMValidationFailedCount))
 	return b.String(), nil
+}
+
+func writeUtteranceTable(b *strings.Builder, items []utteranceDebugItem) {
+	if len(items) == 0 {
+		b.WriteString("- none\n")
+		return
+	}
+	b.WriteString("| conversation_id | utterance_index | text_length | quality_decision | utterance_text |\n")
+	b.WriteString("| --- | ---: | ---: | --- | --- |\n")
+	for _, item := range items {
+		b.WriteString(fmt.Sprintf(
+			"| `%s` | `%d` | `%d` | `%s` | `%s` |\n",
+			item.ConversationID,
+			item.UtteranceIndex,
+			item.TextLength,
+			strings.ReplaceAll(item.SpeakerQualityDecision, "`", "'"),
+			strings.ReplaceAll(item.UtteranceText, "`", "'"),
+		))
+	}
 }
 
 func FormatReport(r reportMetrics) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("total_rows=%d\n", r.TotalRows))
 	b.WriteString(fmt.Sprintf("total_conversations=%d\n", r.TotalConversations))
-	b.WriteString(fmt.Sprintf("speaker_accuracy_percent=%.2f (%d/%d)\n", r.SpeakerAccuracyPercent, r.SpeakerMatchCount, r.TotalRows))
-	b.WriteString(fmt.Sprintf("green_replicas=%d (%.2f%%)\n", r.GreenReplicaCount, r.GreenReplicaPercent))
-	b.WriteString(fmt.Sprintf("red_replicas=%d (%.2f%%)\n", r.RedReplicaCount, r.RedReplicaPercent))
-	b.WriteString(fmt.Sprintf("empathy_confidence_avg=%.4f\n", r.EmpathyConfidenceAvg))
-	b.WriteString(fmt.Sprintf("empathy_review_pending=%d\n", r.ReviewPendingCount))
-	b.WriteString(fmt.Sprintf("empathy_review_ok=%d\n", r.ReviewOKCount))
-	b.WriteString(fmt.Sprintf("empathy_review_not_ok=%d\n", r.ReviewNotOKCount))
+	b.WriteString(fmt.Sprintf("speaker_accuracy_raw_percent=%.2f (%d/%d)\n", r.SpeakerAccuracyRawPercent, r.SpeakerCorrectRawCount, r.TotalRows))
+	b.WriteString(fmt.Sprintf("speaker_accuracy_final_percent=%.2f (%d/%d)\n", r.SpeakerAccuracyFinalPercent, r.SpeakerCorrectFinalCount, r.TotalRows))
+	b.WriteString(fmt.Sprintf("farewell_override_count=%d\n", r.FarewellOverrideCount))
+	b.WriteString(fmt.Sprintf("speaker_evidence_invalid_count=%d\n", r.SpeakerEvidenceInvalidCount))
+	b.WriteString(fmt.Sprintf("empathy_review_pending_applicable=%d\n", r.EmpathyReviewPendingCount))
+	b.WriteString(fmt.Sprintf("empathy_review_ok=%d\n", r.EmpathyReviewOKCount))
+	b.WriteString(fmt.Sprintf("empathy_review_not_ok=%d\n", r.EmpathyReviewNotOKCount))
 	return b.String()
 }
 

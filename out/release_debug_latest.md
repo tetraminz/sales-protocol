@@ -1,20 +1,36 @@
 # Release Debug
 
 ## Summary
-- green replicas: `98` (100.00%)
-- red replicas: `0` (0.00%)
-- green conversations: `5` (100.00%)
-- red conversations: `0` (0.00%)
+- total_rows: `96`
+- raw_mismatch_count: `1`
+- final_mismatch_count: `0`
+- farewell_override_count: `1`
+- speaker_evidence_invalid_count: `0`
 
-## Red Conversations
+## Red Conversations (Raw)
+| conversation_id | raw_red_rows | total_rows | top_reason |
+| --- | ---: | ---: | --- |
+| `modamart__3_transcript` | `1` | `17` | raw_speaker_mismatch (1) |
+
+## Red Conversations (Final)
 - none
 
-## Empathy Review Backlog
-- pending_count: `98`
-- not_ok_count: `0`
+## Top Raw Mismatches
+| conversation_id | utterance_index | text_length | quality_decision | utterance_text |
+| --- | ---: | ---: | --- | --- |
+| `modamart__3_transcript` | `17` | `8` | `farewell_context_override` | `Goodbye!` |
 
-## Not-OK Empathy Rows
+## Top Final Mismatches
 - none
 
-## Top Short-Utterance Mismatches
+## Top Evidence Invalid
 - none
+
+## Top Short-Utterance Raw Mismatches
+| conversation_id | utterance_index | text_length | quality_decision | utterance_text |
+| --- | ---: | ---: | --- | --- |
+| `modamart__3_transcript` | `17` | `8` | `farewell_context_override` | `Goodbye!` |
+
+## LLM Event Failures
+- parse_failed: `0`
+- validation_failed: `3`
