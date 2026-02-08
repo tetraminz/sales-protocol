@@ -1,19 +1,20 @@
 # sales_protocol
 
-SQLite-only KISS процесс:
-- верхнеуровневая бизнес-документация SGR в `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/business_process_sgr.go`
-- разметка по диапазону CSV прямо в SQLite с `run_id` и OpenAI-классификацией спикера
-- empathy не классифицируется автоматически: только manual-review
-- аналитика и release-debug в markdown (`green/red`, сломанные диалоги, delta к предыдущему запуску)
+KISS-процесс разметки:
+- бизнес-оркестрация SGR в `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/business_process_sgr.go` (без SQL/IO)
+- аннотация CSV напрямую в SQLite (один актуальный срез, без `run_id`)
+- speaker и empathy confidence считаются через OpenAI
+- финальная проверка empathy делается вручную в SQLite (`pending|ok|not_ok`)
+- analytics/debug/report строятся из текущего состояния базы
 
-## Быстрый запуск
+## Команды
 
 ```bash
 go run . setup --db out/annotations.db
-OPENAI_API_KEY=... go run . annotate --db out/annotations.db --input_dir /Users/ablackman/data/sales-transcripts/data/chunked_transcripts --from_idx 1 --to_idx 20 --release_tag manual --model gpt-4.1-mini --max_retries 2
-go run . analytics --db out/annotations.db --run_id latest --out out/analytics_latest.md
-go run . debug-release --db out/annotations.db --run_id latest --out out/release_debug_latest.md
-go run . report --db out/annotations.db --run_id latest
+go run . annotate --db out/annotations.db --input_dir /Users/ablackman/data/sales-transcripts/data/chunked_transcripts --from_idx 1 --to_idx 5 --model gpt-4.1-mini
+go run . analytics --db out/annotations.db --out out/analytics_latest.md
+go run . debug-release --db out/annotations.db --out out/release_debug_latest.md
+go run . report --db out/annotations.db
 ```
 
 Через `make`:
@@ -28,34 +29,68 @@ make release-check
 make test
 ```
 
+## Минимальная схема
+
+Таблица `annotations`:
+- `conversation_id`, `replica_id` (PK)
+- `speaker_true`, `speaker_predicted`, `speaker_confidence`, `speaker_match`
+- `empathy_confidence`, `empathy_review_status`, `empathy_reviewer_note`
+- `replica_text`, `model`, `annotated_at_utc`
+
+`setup` делает hard reset схемы, `annotate` очищает `annotations` и записывает новый срез.
+Если база от старой версии, сначала обязательно выполнить `setup`.
+
 ## Логи annotate
 
-Во время `annotate` печатаются строки прогресса:
-- `annotate_start` — run metadata (run_id, модель, диапазон, db)
-- `annotate_file` / `annotate_file_done` — начало/итог по одному CSV-диалогу
-- `annotate_row` — каждая записанная реплика (`conversation`, `replica`, `speaker_true/predicted`, `match`, `speaker_ok`)
-- `annotate_progress` — агрегированный прогресс каждые 25 реплик
-- `annotate_done` — финальные totals по запуску
+Во время `annotate` печатаются:
+- `annotate_start`
+- `annotate_file`
+- `annotate_row`
+- `annotate_progress` (каждые 25 реплик)
+- `annotate_done`
+- `annotate_log` (speaker/empathy/pipeline info+error для дебага LLM)
 
-## Что делает release debug
+Также эти логи пишутся в таблицу `annotate_logs`.
+Если LLM дал невалидный ответ, `annotate` продолжает run, пишет error в `annotate_logs` и сохраняет реплику в `annotations`.
 
-- доля green/red реплик
-- доля green/red диалогов
-- список красных диалогов и причины
-- delta относительно предыдущего run (`speaker_accuracy`, green/red, mismatch)
+Все фейлы:
 
-## Переменные окружения
+```sql
+SELECT created_at_utc, conversation_id, replica_id, stage, message
+FROM annotate_logs
+WHERE status='error'
+ORDER BY id;
+```
 
-- `OPENAI_API_KEY` — обязателен для `annotate`
-- `OPENAI_BASE_URL` — опционально, по умолчанию `https://api.openai.com`
+Последний ответ модели для конкретной реплики:
 
-## Ключевые файлы
+```sql
+SELECT stage, status, message, raw_json
+FROM annotate_logs
+WHERE conversation_id='...' AND replica_id=...
+ORDER BY id DESC;
+```
 
-- `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/business_process_sgr.go`  
-  Верхнеуровневая бизнес-документация процесса SGR без SQL/IO.
-- `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/sqlite_migration.go`  
-  SQLite setup, annotate по диапазону, analytics markdown, debug markdown, report.
+## Manual empathy review (SQL)
 
-## Референсы
+Pending:
 
-- Референс SGR: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/docs/SKILL.md`
+```sql
+SELECT conversation_id, replica_id, replica_text, empathy_confidence
+FROM annotations
+WHERE empathy_review_status = 'pending'
+ORDER BY empathy_confidence DESC;
+```
+
+Mark reviewed:
+
+```sql
+UPDATE annotations
+SET empathy_review_status = 'ok', empathy_reviewer_note = 'looks good'
+WHERE conversation_id = 'conv_id' AND replica_id = 10;
+```
+
+## Ссылки
+
+- ТЗ: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/docs/CODEX_TZ_guided_reasoning_minimal.md`
+- SGR reference: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/docs/SKILL.md`
