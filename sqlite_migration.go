@@ -27,6 +27,7 @@ const (
 	defaultAnnotateModel = "gpt-4.1-mini"
 	defaultOpenAIBaseURL = "https://api.openai.com"
 	speakerCustomer      = "Customer"
+	shortUtteranceMaxLen = 40
 )
 
 type AnnotateConfig struct {
@@ -70,6 +71,13 @@ type conversationDebugItem struct {
 	TopReasons     []string
 }
 
+type shortUtteranceMismatch struct {
+	ConversationID string
+	ReplicaID      int
+	ReplicaText    string
+	TextLength     int
+}
+
 type reportMetrics struct {
 	Run runRecord
 
@@ -82,6 +90,9 @@ type reportMetrics struct {
 	EmpathyRanCount             int
 	EmpathyPresentCount         int
 	EmpathyPresentPercent       float64
+	LabelFormatMismatchCount    int
+	ModelMismatchCount          int
+	TransientRetryErrorCount    int
 
 	GreenReplicaCount      int
 	RedReplicaCount        int
@@ -96,18 +107,23 @@ type reportMetrics struct {
 	TopSpeakerValidationErrors []reportErrorCount
 	TopEmpathyValidationErrors []reportErrorCount
 	RedConversations           []conversationDebugItem
+	ShortUtteranceMismatches   []shortUtteranceMismatch
 }
 
 type analyzedReplicaRow struct {
-	ConversationID string
-	SpeakerMatch   bool
-	SpeakerOK      bool
-	SpeakerErrors  []string
-	EmpathyRan     bool
-	EmpathyOK      bool
-	EmpathyPresent bool
-	EmpathyType    string
-	EmpathyErrors  []string
+	ConversationID   string
+	ReplicaID        int
+	SpeakerTrue      string
+	SpeakerPredicted string
+	ReplicaText      string
+	SpeakerMatch     bool
+	SpeakerOK        bool
+	SpeakerErrors    []string
+	EmpathyRan       bool
+	EmpathyOK        bool
+	EmpathyPresent   bool
+	EmpathyType      string
+	EmpathyErrors    []string
 }
 
 type annotateTurn struct {
@@ -533,6 +549,25 @@ func BuildAnalyticsMarkdown(dbPath, runIDOrLatest string) (string, error) {
 	}
 	b.WriteString("\n")
 
+	b.WriteString("## Root Cause Breakdown\n")
+	b.WriteString(fmt.Sprintf("- label_format_mismatch_false_red_count: `%d`\n", report.LabelFormatMismatchCount))
+	b.WriteString(fmt.Sprintf("- real_model_mismatch_count: `%d`\n", report.ModelMismatchCount))
+	b.WriteString(fmt.Sprintf("- transient_retry_error_count: `%d`\n", report.TransientRetryErrorCount))
+	b.WriteString("- top_short_utterance_mismatches:\n")
+	if len(report.ShortUtteranceMismatches) == 0 {
+		b.WriteString("  - none\n")
+	} else {
+		for _, item := range report.ShortUtteranceMismatches {
+			b.WriteString(fmt.Sprintf("  - `%s` / replica `%d` / len `%d`: `%s`\n",
+				item.ConversationID,
+				item.ReplicaID,
+				item.TextLength,
+				item.ReplicaText,
+			))
+		}
+	}
+	b.WriteString("\n")
+
 	b.WriteString("## Short Conclusion\n")
 	b.WriteString(fmt.Sprintf("- Разметка стабильна на `%.2f%%` speaker accuracy.\n", report.SpeakerAccuracyPercent))
 	b.WriteString(fmt.Sprintf("- Красных реплик: `%d` из `%d`.\n", report.RedReplicaCount, report.TotalRows))
@@ -605,6 +640,28 @@ func BuildReleaseDebugMarkdown(dbPath, runIDOrLatest string) (string, error) {
 		b.WriteString("\n")
 	}
 
+	b.WriteString("## Root Cause Breakdown\n")
+	b.WriteString(fmt.Sprintf("- label_format_mismatch_false_red_count: `%d`\n", current.LabelFormatMismatchCount))
+	b.WriteString(fmt.Sprintf("- real_model_mismatch_count: `%d`\n", current.ModelMismatchCount))
+	b.WriteString(fmt.Sprintf("- transient_retry_error_count: `%d`\n\n", current.TransientRetryErrorCount))
+
+	b.WriteString("## Top Short-Utterance Mismatches\n")
+	if len(current.ShortUtteranceMismatches) == 0 {
+		b.WriteString("- none\n\n")
+	} else {
+		b.WriteString("| conversation_id | replica_id | text_length | replica_text |\n")
+		b.WriteString("| --- | ---: | ---: | --- |\n")
+		for _, item := range current.ShortUtteranceMismatches {
+			b.WriteString(fmt.Sprintf("| `%s` | `%d` | `%d` | `%s` |\n",
+				item.ConversationID,
+				item.ReplicaID,
+				item.TextLength,
+				strings.ReplaceAll(item.ReplicaText, "`", "'"),
+			))
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString("## Delta vs previous run\n")
 	if !delta.HasPrevious {
 		b.WriteString("- previous run: `none`\n")
@@ -650,6 +707,9 @@ func FormatReport(r reportMetrics) string {
 	b.WriteString(fmt.Sprintf("total_conversations=%d\n", r.TotalConversations))
 	b.WriteString(fmt.Sprintf("speaker_accuracy_percent=%.2f (%d/%d)\n", r.SpeakerAccuracyPercent, r.SpeakerMatchCount, r.TotalRows))
 	b.WriteString(fmt.Sprintf("quality_speaker_mismatch_count=%d\n", r.QualitySpeakerMismatchCount))
+	b.WriteString(fmt.Sprintf("label_format_mismatch_false_red_count=%d\n", r.LabelFormatMismatchCount))
+	b.WriteString(fmt.Sprintf("real_model_mismatch_count=%d\n", r.ModelMismatchCount))
+	b.WriteString(fmt.Sprintf("transient_retry_error_count=%d\n", r.TransientRetryErrorCount))
 	b.WriteString(fmt.Sprintf("green_replicas=%d (%.2f%%)\n", r.GreenReplicaCount, r.GreenReplicaPercent))
 	b.WriteString(fmt.Sprintf("red_replicas=%d (%.2f%%)\n", r.RedReplicaCount, r.RedReplicaPercent))
 	return b.String()
@@ -688,6 +748,10 @@ func collectRunMetrics(db *sql.DB, runID string) (reportMetrics, error) {
 	rows, err := db.Query(`
 		SELECT
 			conversation_id,
+			replica_id,
+			speaker_true,
+			speaker_predicted,
+			replica_text,
 			speaker_match,
 			speaker_ok,
 			speaker_validation_errors_json,
@@ -712,6 +776,10 @@ func collectRunMetrics(db *sql.DB, runID string) (reportMetrics, error) {
 	report := reportMetrics{Run: run}
 	for rows.Next() {
 		var convoID string
+		var replicaID int
+		var speakerTrue string
+		var speakerPredicted string
+		var replicaText string
 		var speakerMatch int
 		var speakerOK int
 		var speakerErrorsJSON string
@@ -723,6 +791,10 @@ func collectRunMetrics(db *sql.DB, runID string) (reportMetrics, error) {
 
 		if err := rows.Scan(
 			&convoID,
+			&replicaID,
+			&speakerTrue,
+			&speakerPredicted,
+			&replicaText,
 			&speakerMatch,
 			&speakerOK,
 			&speakerErrorsJSON,
@@ -736,15 +808,19 @@ func collectRunMetrics(db *sql.DB, runID string) (reportMetrics, error) {
 		}
 
 		row := analyzedReplicaRow{
-			ConversationID: convoID,
-			SpeakerMatch:   speakerMatch == 1,
-			SpeakerOK:      speakerOK == 1,
-			SpeakerErrors:  parseStringArray(speakerErrorsJSON),
-			EmpathyRan:     empathyRan == 1,
-			EmpathyOK:      empathyOK == 1,
-			EmpathyPresent: empathyPresent == 1,
-			EmpathyType:    empathyType,
-			EmpathyErrors:  parseStringArray(empathyErrorsJSON),
+			ConversationID:   convoID,
+			ReplicaID:        replicaID,
+			SpeakerTrue:      speakerTrue,
+			SpeakerPredicted: speakerPredicted,
+			ReplicaText:      replicaText,
+			SpeakerMatch:     speakerMatch == 1,
+			SpeakerOK:        speakerOK == 1,
+			SpeakerErrors:    parseStringArray(speakerErrorsJSON),
+			EmpathyRan:       empathyRan == 1,
+			EmpathyOK:        empathyOK == 1,
+			EmpathyPresent:   empathyPresent == 1,
+			EmpathyType:      empathyType,
+			EmpathyErrors:    parseStringArray(empathyErrorsJSON),
 		}
 
 		report.TotalRows++
@@ -770,6 +846,25 @@ func collectRunMetrics(db *sql.DB, runID string) (reportMetrics, error) {
 		}
 		for _, errItem := range row.EmpathyErrors {
 			empathyErrCounts[errItem]++
+		}
+		if row.SpeakerMatch && row.SpeakerOK && len(row.SpeakerErrors) > 0 {
+			report.TransientRetryErrorCount++
+		}
+		if !row.SpeakerMatch {
+			if canonicalSpeakerLabel(row.SpeakerTrue) == canonicalSpeakerLabel(row.SpeakerPredicted) {
+				report.LabelFormatMismatchCount++
+			} else {
+				report.ModelMismatchCount++
+				text := strings.TrimSpace(row.ReplicaText)
+				if len([]rune(text)) <= shortUtteranceMaxLen {
+					report.ShortUtteranceMismatches = append(report.ShortUtteranceMismatches, shortUtteranceMismatch{
+						ConversationID: row.ConversationID,
+						ReplicaID:      row.ReplicaID,
+						ReplicaText:    text,
+						TextLength:     len([]rune(text)),
+					})
+				}
+			}
 		}
 
 		state, ok := conversations[row.ConversationID]
@@ -821,6 +916,18 @@ func collectRunMetrics(db *sql.DB, runID string) (reportMetrics, error) {
 	report.TopEmpathyValidationErrors = toSortedErrorCounts(empathyErrCounts)
 	report.QualitySpeakerMismatchCount = speakerErrCounts["quality:speaker_mismatch"]
 	report.RedConversations = buildRedConversationItems(conversations)
+	sort.Slice(report.ShortUtteranceMismatches, func(i, j int) bool {
+		if report.ShortUtteranceMismatches[i].TextLength == report.ShortUtteranceMismatches[j].TextLength {
+			if report.ShortUtteranceMismatches[i].ConversationID == report.ShortUtteranceMismatches[j].ConversationID {
+				return report.ShortUtteranceMismatches[i].ReplicaID < report.ShortUtteranceMismatches[j].ReplicaID
+			}
+			return report.ShortUtteranceMismatches[i].ConversationID < report.ShortUtteranceMismatches[j].ConversationID
+		}
+		return report.ShortUtteranceMismatches[i].TextLength < report.ShortUtteranceMismatches[j].TextLength
+	})
+	if len(report.ShortUtteranceMismatches) > 10 {
+		report.ShortUtteranceMismatches = report.ShortUtteranceMismatches[:10]
+	}
 	return report, nil
 }
 
@@ -1231,7 +1338,20 @@ func getField(rec []string, idx int) string {
 }
 
 func normalizeSpeaker(raw string) string {
-	return strings.TrimSpace(raw)
+	return canonicalSpeakerLabel(raw)
+}
+
+func canonicalSpeakerLabel(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, "*")
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, speakerSalesRep) {
+		return speakerSalesRep
+	}
+	if strings.EqualFold(s, speakerCustomer) {
+		return speakerCustomer
+	}
+	return s
 }
 
 type openAIMessage struct {
@@ -1302,8 +1422,10 @@ func (c *openAISpeakerCase) Evaluate(ctx context.Context, in ReplicaCaseInput) (
 	}
 
 	last := ReplicaCaseResult{}
+	lastAttemptErrors := []string{}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		c.trace.Attempts++
+		attemptErrors := []string{}
 		content, requestID, err := c.client.generateStructured(
 			ctx,
 			c.model,
@@ -1315,13 +1437,15 @@ func (c *openAISpeakerCase) Evaluate(ctx context.Context, in ReplicaCaseInput) (
 			c.trace.RequestIDs = append(c.trace.RequestIDs, requestID)
 		}
 		if err != nil {
-			c.trace.ValidationErrors = append(c.trace.ValidationErrors, fmt.Sprintf("attempt %d: api_error: %v", attempt, err))
+			attemptErrors = append(attemptErrors, fmt.Sprintf("attempt %d: api_error: %v", attempt, err))
+			lastAttemptErrors = attemptErrors
 			continue
 		}
 
 		var parsed speakerLLMOutput
 		if err := json.Unmarshal([]byte(content), &parsed); err != nil {
-			c.trace.ValidationErrors = append(c.trace.ValidationErrors, fmt.Sprintf("attempt %d: parse_error: %v", attempt, err))
+			attemptErrors = append(attemptErrors, fmt.Sprintf("attempt %d: parse_error: %v", attempt, err))
+			lastAttemptErrors = attemptErrors
 			continue
 		}
 		parsed.Confidence = clamp01(parsed.Confidence)
@@ -1334,15 +1458,18 @@ func (c *openAISpeakerCase) Evaluate(ctx context.Context, in ReplicaCaseInput) (
 		validation := validateSpeakerPrediction(parsed, in.ReplicaText)
 		if len(validation) > 0 {
 			for _, item := range validation {
-				c.trace.ValidationErrors = append(c.trace.ValidationErrors, fmt.Sprintf("attempt %d: %s", attempt, item))
+				attemptErrors = append(attemptErrors, fmt.Sprintf("attempt %d: %s", attempt, item))
 			}
+			lastAttemptErrors = attemptErrors
 			continue
 		}
 
 		c.trace.OK = true
+		c.trace.ValidationErrors = []string{}
 		return last, nil
 	}
 
+	c.trace.ValidationErrors = append([]string{}, lastAttemptErrors...)
 	return last, nil
 }
 
@@ -1384,9 +1511,9 @@ func copyTrace(in unitTrace) unitTrace {
 }
 
 func speakerMessages(prevText, replicaText, nextText string) []openAIMessage {
-	system := "Return JSON only. Follow the schema strictly. evidence.quote must be an exact substring of current."
+	system := "Return JSON only. Follow the schema strictly. evidence.quote must be an exact substring of current. For short or ambiguous current text (for example bye/thanks), use previous and next context to decide speaker."
 	user := fmt.Sprintf(
-		"previous: %q\ncurrent: %q\nnext: %q\nTask: predict who wrote current: Sales Rep or Customer.",
+		"previous: %q\ncurrent: %q\nnext: %q\nTask: predict who wrote current: Sales Rep or Customer. If current alone is ambiguous, rely on neighboring context.",
 		prevText,
 		replicaText,
 		nextText,
@@ -1503,10 +1630,12 @@ func (c *openAIClient) generateStructured(
 }
 
 func buildAnnotationInsert(runID, model string, replica annotateReplica, out ProcessOutput, speakerTrace unitTrace, empathyTrace unitTrace) annotationInsert {
+	speakerTrueCanonical := canonicalSpeakerLabel(replica.SpeakerTrue)
+	speakerPredictedCanonical := canonicalSpeakerLabel(out.Speaker.PredictedSpeaker)
 	speakerValidationErrors := append([]string{}, speakerTrace.ValidationErrors...)
 	speakerOK := speakerTrace.OK
 
-	if out.Speaker.PredictedSpeaker != speakerSalesRep && out.Speaker.PredictedSpeaker != speakerCustomer {
+	if speakerPredictedCanonical != speakerSalesRep && speakerPredictedCanonical != speakerCustomer {
 		speakerOK = false
 		speakerValidationErrors = append(speakerValidationErrors, "format:predicted_speaker_invalid")
 	}
@@ -1517,16 +1646,17 @@ func buildAnnotationInsert(runID, model string, replica annotateReplica, out Pro
 		speakerOK = false
 		speakerValidationErrors = append(speakerValidationErrors, "format:evidence_quote_not_substring")
 	}
-	if out.Speaker.QualityMismatch {
-		speakerValidationErrors = append(speakerValidationErrors, "quality:speaker_mismatch")
-	}
 
 	speakerMatch := 0
-	if out.Speaker.PredictedSpeaker == replica.SpeakerTrue {
+	if speakerPredictedCanonical == speakerTrueCanonical {
 		speakerMatch = 1
+	} else {
+		speakerValidationErrors = append(speakerValidationErrors, "quality:speaker_mismatch")
 	}
+	speakerValidationErrors = dedupeStringList(speakerValidationErrors)
+
 	speakerOutput := mustJSON(map[string]any{
-		"predicted_speaker": out.Speaker.PredictedSpeaker,
+		"predicted_speaker": speakerPredictedCanonical,
 		"confidence":        clamp01(out.Speaker.Confidence),
 		"evidence": map[string]any{
 			"quote": out.Speaker.EvidenceQuote,
@@ -1572,6 +1702,7 @@ func buildAnnotationInsert(runID, model string, replica annotateReplica, out Pro
 			}
 		}
 	}
+	empathyValidationErrors = dedupeStringList(empathyValidationErrors)
 
 	empathyEvidence := []map[string]string{}
 	if out.Empathy.EmpathyPresent && strings.TrimSpace(out.Empathy.EvidenceQuote) != "" {
@@ -1601,8 +1732,8 @@ func buildAnnotationInsert(runID, model string, replica annotateReplica, out Pro
 		RunID:                       runID,
 		ConversationID:              replica.ConversationID,
 		ReplicaID:                   replica.ReplicaID,
-		SpeakerTrue:                 replica.SpeakerTrue,
-		SpeakerPredicted:            out.Speaker.PredictedSpeaker,
+		SpeakerTrue:                 speakerTrueCanonical,
+		SpeakerPredicted:            speakerPredictedCanonical,
 		SpeakerMatch:                speakerMatch,
 		SpeakerOK:                   boolToInt(speakerOK),
 		SpeakerAttempts:             speakerAttempts,
@@ -1655,6 +1786,9 @@ func reasonsForRedReplica(row analyzedReplicaRow) []string {
 		reasons = append(reasons, "speaker_mismatch")
 	}
 	for _, errItem := range row.SpeakerErrors {
+		if errItem == "quality:speaker_mismatch" {
+			continue
+		}
 		reasons = append(reasons, "speaker:"+errItem)
 	}
 
@@ -1670,7 +1804,7 @@ func reasonsForRedReplica(row analyzedReplicaRow) []string {
 	if len(reasons) == 0 {
 		reasons = append(reasons, "unknown")
 	}
-	return reasons
+	return dedupeStringList(reasons)
 }
 
 func buildRedConversationItems(conversations map[string]*conversationAccumulator) []conversationDebugItem {
@@ -1748,6 +1882,22 @@ func parseStringArray(raw string) []string {
 		return []string{}
 	}
 	return items
+}
+
+func dedupeStringList(items []string) []string {
+	if len(items) == 0 {
+		return []string{}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
 }
 
 func generateRunID(tag string) string {

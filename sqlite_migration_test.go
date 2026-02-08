@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -31,6 +32,155 @@ func TestSetupSQLite_CreatesRunAndAnnotationsTables(t *testing.T) {
 	assertTableExists(t, db, "annotation_runs")
 	assertTableExists(t, db, "annotations")
 	assertIndexExists(t, db, "idx_annotations_run_id")
+}
+
+func TestNormalizeSpeakerLabel_StripsMarkdownAsterisks(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{in: "**Sales Rep", want: speakerSalesRep},
+		{in: "**Customer", want: speakerCustomer},
+		{in: "  *Sales Rep*  ", want: speakerSalesRep},
+		{in: "**Prospect**", want: "Prospect"},
+	}
+
+	for _, tc := range cases {
+		got := normalizeSpeaker(tc.in)
+		if got != tc.want {
+			t.Fatalf("normalizeSpeaker(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestBuildAnnotationInsert_UsesCanonicalSpeakerMatch(t *testing.T) {
+	row := buildAnnotationInsert(
+		"run_test",
+		"gpt-4.1-mini",
+		annotateReplica{
+			ConversationID: "conv_a",
+			ReplicaID:      1,
+			SpeakerTrue:    "**Sales Rep",
+			Text:           "Hello there",
+			TurnIDs:        []int{1},
+		},
+		ProcessOutput{
+			Speaker: ReplicaCaseResult{
+				PredictedSpeaker: speakerSalesRep,
+				Confidence:       0.9,
+				EvidenceQuote:    "Hello",
+			},
+			Empathy: EmpathyCaseResult{
+				Ran:            false,
+				EmpathyPresent: false,
+				EmpathyType:    "none",
+			},
+		},
+		unitTrace{Ran: true, OK: true, Attempts: 1, ValidationErrors: []string{}, RequestIDs: []string{"req_1"}},
+		unitTrace{Ran: false, OK: true, Attempts: 0, ValidationErrors: []string{}, RequestIDs: []string{}},
+	)
+
+	if row.SpeakerTrue != speakerSalesRep {
+		t.Fatalf("speaker_true=%q want %q", row.SpeakerTrue, speakerSalesRep)
+	}
+	if row.SpeakerPredicted != speakerSalesRep {
+		t.Fatalf("speaker_predicted=%q want %q", row.SpeakerPredicted, speakerSalesRep)
+	}
+	if row.SpeakerMatch != 1 {
+		t.Fatalf("speaker_match=%d want 1", row.SpeakerMatch)
+	}
+	errors := parseStringArray(row.SpeakerValidationErrorsJSON)
+	if len(errors) != 0 {
+		t.Fatalf("speaker_validation_errors=%v want []", errors)
+	}
+}
+
+func TestOpenAISpeakerCase_FinalSuccessHasNoTransientErrors(t *testing.T) {
+	var calls int64
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt64(&calls, 1)
+		quote := "missing"
+		if call >= 3 {
+			quote = "Hello"
+		}
+
+		content := mustJSON(map[string]any{
+			"predicted_speaker": speakerSalesRep,
+			"confidence":        0.9,
+			"evidence": map[string]any{
+				"quote": quote,
+			},
+		})
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"content": content,
+						"refusal": "",
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("x-request-id", fmt.Sprintf("req_%d", call))
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode mock response: %v", err)
+		}
+	}))
+	defer mock.Close()
+
+	c := &openAISpeakerCase{
+		client: &openAIClient{
+			apiKey:  "test_key",
+			baseURL: mock.URL,
+			httpClient: &http.Client{
+				Timeout: 5 * time.Second,
+			},
+		},
+		model:      "gpt-4.1-mini",
+		maxRetries: 2,
+	}
+
+	_, err := c.Evaluate(context.Background(), ReplicaCaseInput{
+		PrevText:    "Previous",
+		ReplicaText: "Hello there",
+		NextText:    "Next",
+	})
+	if err != nil {
+		t.Fatalf("evaluate speaker case: %v", err)
+	}
+
+	trace := c.LastTrace()
+	if !trace.OK {
+		t.Fatalf("trace.OK=false want true")
+	}
+	if trace.Attempts != 3 {
+		t.Fatalf("trace.Attempts=%d want 3", trace.Attempts)
+	}
+	if len(trace.ValidationErrors) != 0 {
+		t.Fatalf("trace.ValidationErrors=%v want []", trace.ValidationErrors)
+	}
+}
+
+func TestReasonsForRedReplica_NoDuplicateMismatchReason(t *testing.T) {
+	reasons := reasonsForRedReplica(analyzedReplicaRow{
+		SpeakerMatch:  false,
+		SpeakerOK:     true,
+		SpeakerErrors: []string{"quality:speaker_mismatch"},
+	})
+
+	countMismatch := 0
+	for _, reason := range reasons {
+		if reason == "speaker_mismatch" {
+			countMismatch++
+		}
+		if reason == "speaker:quality:speaker_mismatch" {
+			t.Fatalf("unexpected duplicate mismatch reason: %v", reasons)
+		}
+	}
+	if countMismatch != 1 {
+		t.Fatalf("speaker_mismatch count=%d want 1, reasons=%v", countMismatch, reasons)
+	}
 }
 
 func TestAnnotateRange_RespectsFromToInclusive(t *testing.T) {
@@ -239,9 +389,122 @@ func TestAnalyticsMarkdown_ContainsCoreSections(t *testing.T) {
 		"## Speaker Accuracy",
 		"## Empathy",
 		"## Top Validation Errors",
+		"## Root Cause Breakdown",
 	} {
 		if !strings.Contains(md, section) {
 			t.Fatalf("analytics markdown missing section %q", section)
+		}
+	}
+}
+
+func TestAnalytics_RootCauseBreakdownSectionsPresent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+	runID := "run_root_cause_analytics"
+	seedRun(t, dbPath, runID, time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339))
+
+	seedAnnotationRaw(t, dbPath, annotationInsert{
+		RunID:                       runID,
+		ConversationID:              "conv_fmt",
+		ReplicaID:                   1,
+		SpeakerTrue:                 "**Sales Rep",
+		SpeakerPredicted:            speakerSalesRep,
+		SpeakerMatch:                0,
+		SpeakerOK:                   1,
+		SpeakerAttempts:             1,
+		SpeakerValidationErrorsJSON: mustJSON([]string{"quality:speaker_mismatch"}),
+		SpeakerOutputJSON: mustJSON(map[string]any{
+			"predicted_speaker": speakerSalesRep,
+			"confidence":        0.95,
+			"evidence":          map[string]string{"quote": "Hello"},
+		}),
+		EmpathyRan:                  0,
+		EmpathyOK:                   1,
+		EmpathyPresent:              0,
+		EmpathyType:                 "none",
+		EmpathyConfidence:           0,
+		EmpathyAttempts:             0,
+		EmpathyValidationErrorsJSON: "[]",
+		EmpathyOutputJSON:           mustJSON(map[string]any{"empathy_present": false, "empathy_type": "none", "confidence": 0, "evidence": []any{}}),
+		ReplicaText:                 "Hello there",
+		TurnIDsJSON:                 mustJSON([]int{1}),
+		Model:                       "seed_model",
+		TimestampUTC:                time.Now().UTC().Format(time.RFC3339),
+		RequestIDsJSON:              "[]",
+	})
+	seedAnnotationRaw(t, dbPath, annotationInsert{
+		RunID:                       runID,
+		ConversationID:              "conv_short",
+		ReplicaID:                   2,
+		SpeakerTrue:                 speakerSalesRep,
+		SpeakerPredicted:            speakerCustomer,
+		SpeakerMatch:                0,
+		SpeakerOK:                   1,
+		SpeakerAttempts:             1,
+		SpeakerValidationErrorsJSON: mustJSON([]string{"quality:speaker_mismatch"}),
+		SpeakerOutputJSON: mustJSON(map[string]any{
+			"predicted_speaker": speakerCustomer,
+			"confidence":        0.95,
+			"evidence":          map[string]string{"quote": "Bye."},
+		}),
+		EmpathyRan:                  0,
+		EmpathyOK:                   1,
+		EmpathyPresent:              0,
+		EmpathyType:                 "none",
+		EmpathyConfidence:           0,
+		EmpathyAttempts:             0,
+		EmpathyValidationErrorsJSON: "[]",
+		EmpathyOutputJSON:           mustJSON(map[string]any{"empathy_present": false, "empathy_type": "none", "confidence": 0, "evidence": []any{}}),
+		ReplicaText:                 "Bye.",
+		TurnIDsJSON:                 mustJSON([]int{2}),
+		Model:                       "seed_model",
+		TimestampUTC:                time.Now().UTC().Format(time.RFC3339),
+		RequestIDsJSON:              "[]",
+	})
+	seedAnnotationRaw(t, dbPath, annotationInsert{
+		RunID:                       runID,
+		ConversationID:              "conv_retry",
+		ReplicaID:                   3,
+		SpeakerTrue:                 speakerCustomer,
+		SpeakerPredicted:            speakerCustomer,
+		SpeakerMatch:                1,
+		SpeakerOK:                   1,
+		SpeakerAttempts:             3,
+		SpeakerValidationErrorsJSON: mustJSON([]string{"attempt 1: format:evidence_quote_not_substring"}),
+		SpeakerOutputJSON: mustJSON(map[string]any{
+			"predicted_speaker": speakerCustomer,
+			"confidence":        0.95,
+			"evidence":          map[string]string{"quote": "Sure"},
+		}),
+		EmpathyRan:                  0,
+		EmpathyOK:                   1,
+		EmpathyPresent:              0,
+		EmpathyType:                 "none",
+		EmpathyConfidence:           0,
+		EmpathyAttempts:             0,
+		EmpathyValidationErrorsJSON: "[]",
+		EmpathyOutputJSON:           mustJSON(map[string]any{"empathy_present": false, "empathy_type": "none", "confidence": 0, "evidence": []any{}}),
+		ReplicaText:                 "Sure, let's talk.",
+		TurnIDsJSON:                 mustJSON([]int{3}),
+		Model:                       "seed_model",
+		TimestampUTC:                time.Now().UTC().Format(time.RFC3339),
+		RequestIDsJSON:              "[]",
+	})
+
+	md, err := BuildAnalyticsMarkdown(dbPath, runID)
+	if err != nil {
+		t.Fatalf("build analytics: %v", err)
+	}
+	for _, item := range []string{
+		"label_format_mismatch_false_red_count: `1`",
+		"real_model_mismatch_count: `1`",
+		"transient_retry_error_count: `1`",
+		"`conv_short` / replica `2`",
+	} {
+		if !strings.Contains(md, item) {
+			t.Fatalf("analytics markdown missing %q\n%s", item, md)
 		}
 	}
 }
@@ -268,6 +531,64 @@ func TestDebugMarkdown_ContainsBrokenDialogsAndReasons(t *testing.T) {
 	}
 	if !strings.Contains(md, "speaker_mismatch") {
 		t.Fatalf("missing failure reason")
+	}
+	if !strings.Contains(md, "## Root Cause Breakdown") {
+		t.Fatalf("missing root cause section")
+	}
+}
+
+func TestDebugRelease_RootCauseAndShortUtteranceSectionPresent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+	runID := "run_root_cause_debug"
+	seedRun(t, dbPath, runID, time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339))
+
+	seedAnnotationRaw(t, dbPath, annotationInsert{
+		RunID:                       runID,
+		ConversationID:              "conv_short",
+		ReplicaID:                   5,
+		SpeakerTrue:                 speakerSalesRep,
+		SpeakerPredicted:            speakerCustomer,
+		SpeakerMatch:                0,
+		SpeakerOK:                   1,
+		SpeakerAttempts:             1,
+		SpeakerValidationErrorsJSON: mustJSON([]string{"quality:speaker_mismatch"}),
+		SpeakerOutputJSON: mustJSON(map[string]any{
+			"predicted_speaker": speakerCustomer,
+			"confidence":        0.95,
+			"evidence":          map[string]string{"quote": "Bye."},
+		}),
+		EmpathyRan:                  0,
+		EmpathyOK:                   1,
+		EmpathyPresent:              0,
+		EmpathyType:                 "none",
+		EmpathyConfidence:           0,
+		EmpathyAttempts:             0,
+		EmpathyValidationErrorsJSON: "[]",
+		EmpathyOutputJSON:           mustJSON(map[string]any{"empathy_present": false, "empathy_type": "none", "confidence": 0, "evidence": []any{}}),
+		ReplicaText:                 "Bye.",
+		TurnIDsJSON:                 mustJSON([]int{5}),
+		Model:                       "seed_model",
+		TimestampUTC:                time.Now().UTC().Format(time.RFC3339),
+		RequestIDsJSON:              "[]",
+	})
+
+	md, err := BuildReleaseDebugMarkdown(dbPath, runID)
+	if err != nil {
+		t.Fatalf("build debug markdown: %v", err)
+	}
+	for _, item := range []string{
+		"## Root Cause Breakdown",
+		"## Top Short-Utterance Mismatches",
+		"`conv_short`",
+		"`5`",
+		"`Bye.`",
+	} {
+		if !strings.Contains(md, item) {
+			t.Fatalf("debug markdown missing %q\n%s", item, md)
+		}
 	}
 }
 
@@ -449,6 +770,50 @@ func seedAnnotation(
 		"[]",
 	); err != nil {
 		t.Fatalf("seed annotation: %v", err)
+	}
+}
+
+func seedAnnotationRaw(t *testing.T, dbPath string, row annotationInsert) {
+	t.Helper()
+	db, err := openSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	if row.TimestampUTC == "" {
+		row.TimestampUTC = time.Now().UTC().Format(time.RFC3339)
+	}
+	if row.RequestIDsJSON == "" {
+		row.RequestIDsJSON = "[]"
+	}
+
+	if _, err := db.Exec(insertAnnotationSQL,
+		row.RunID,
+		row.ConversationID,
+		row.ReplicaID,
+		row.SpeakerTrue,
+		row.SpeakerPredicted,
+		row.SpeakerMatch,
+		row.SpeakerOK,
+		row.SpeakerAttempts,
+		row.SpeakerValidationErrorsJSON,
+		row.SpeakerOutputJSON,
+		row.EmpathyRan,
+		row.EmpathyOK,
+		row.EmpathyPresent,
+		row.EmpathyType,
+		row.EmpathyConfidence,
+		row.EmpathyAttempts,
+		row.EmpathyValidationErrorsJSON,
+		row.EmpathyOutputJSON,
+		row.ReplicaText,
+		row.TurnIDsJSON,
+		row.Model,
+		row.TimestampUTC,
+		row.RequestIDsJSON,
+	); err != nil {
+		t.Fatalf("seed raw annotation: %v", err)
 	}
 }
 
