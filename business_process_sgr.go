@@ -20,7 +20,7 @@ const speakerSalesRep = "Sales Rep"
 // retry strategy lives inside case implementations; process only orchestrates cases
 // and keeps control flow explicit.
 //
-// This file intentionally has no SQL, files, HTTP, or JSONL parsing.
+// This file intentionally has no SQL, files, HTTP, or storage parsing.
 
 type ProcessInput struct {
 	ReplicaText string

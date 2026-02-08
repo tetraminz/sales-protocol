@@ -2,309 +2,528 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestMigrate_RowCount(t *testing.T) {
-	tmp := t.TempDir()
-	in := filepath.Join(tmp, "annotations.jsonl")
-	dbPath := filepath.Join(tmp, "annotations.db")
-
-	lines := []string{
-		testJSONLRecord("conv_1", 1, "Sales Rep", "Sales Rep", true, nil, true, true, "support", 0.9),
-		testJSONLRecord("conv_1", 2, "Customer", "Customer", true, nil, false, false, "none", 0),
-	}
-	if err := os.WriteFile(in, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
-		t.Fatalf("write jsonl: %v", err)
-	}
-
-	inserted, err := MigrateJSONLToSQLite(in, dbPath)
-	if err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if inserted != 2 {
-		t.Fatalf("inserted=%d want 2", inserted)
+func TestSetupSQLite_CreatesRunAndAnnotationsTables(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
 	}
 
 	db, err := openSQLite(dbPath)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
 
-	var got int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM annotations`).Scan(&got); err != nil {
-		t.Fatalf("count rows: %v", err)
-	}
-	if got != 2 {
-		t.Fatalf("row count=%d want 2", got)
-	}
+	assertTableExists(t, db, "annotation_runs")
+	assertTableExists(t, db, "annotations")
+	assertIndexExists(t, db, "idx_annotations_run_id")
 }
 
-func TestMigrate_FieldMapping(t *testing.T) {
+func TestAnnotateRange_RespectsFromToInclusive(t *testing.T) {
 	tmp := t.TempDir()
-	in := filepath.Join(tmp, "annotations.jsonl")
+	csvDir := filepath.Join(tmp, "csv")
 	dbPath := filepath.Join(tmp, "annotations.db")
+	mock := newMockOpenAIServer(t)
+	defer mock.Close()
+	mustWriteCSV(t, csvDir, "a.csv", "conv_a")
+	mustWriteCSV(t, csvDir, "b.csv", "conv_b")
+	mustWriteCSV(t, csvDir, "c.csv", "conv_c")
 
-	line := testJSONLRecord("conv_map", 7, "Sales Rep", "Customer", true, []string{"quality:speaker_mismatch"}, true, true, "validation", 0.7)
-	if err := os.WriteFile(in, []byte(line+"\n"), 0o644); err != nil {
-		t.Fatalf("write jsonl: %v", err)
-	}
-
-	if _, err := MigrateJSONLToSQLite(in, dbPath); err != nil {
-		t.Fatalf("migrate: %v", err)
+	runID, err := AnnotateRangeToSQLite(context.Background(), AnnotateConfig{
+		DBPath:     dbPath,
+		InputDir:   csvDir,
+		FromIdx:    2,
+		ToIdx:      3,
+		ReleaseTag: "range_test",
+		Model:      "gpt-4.1-mini",
+		APIKey:     "test_key",
+		BaseURL:    mock.URL,
+		MaxRetries: 0,
+	})
+	if err != nil {
+		t.Fatalf("annotate range: %v", err)
 	}
 
 	db, err := openSQLite(dbPath)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		t.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
 
-	var predicted string
-	var speakerMatch int
-	var empathyRan int
-	var empathyType string
-	if err := db.QueryRow(`
-		SELECT speaker_predicted, speaker_match, empathy_ran, empathy_type
-		FROM annotations
-		WHERE conversation_id = 'conv_map' AND replica_id = 7
-	`).Scan(&predicted, &speakerMatch, &empathyRan, &empathyType); err != nil {
-		t.Fatalf("query row: %v", err)
+	var conversations int
+	if err := db.QueryRow(`SELECT total_conversations FROM annotation_runs WHERE run_id = ?`, runID).Scan(&conversations); err != nil {
+		t.Fatalf("query run record: %v", err)
+	}
+	if conversations != 2 {
+		t.Fatalf("total_conversations=%d want 2", conversations)
 	}
 
-	if predicted != "Customer" {
-		t.Fatalf("predicted=%q want Customer", predicted)
+	rows, err := db.Query(`SELECT DISTINCT conversation_id FROM annotations WHERE run_id = ? ORDER BY conversation_id`, runID)
+	if err != nil {
+		t.Fatalf("query conversations: %v", err)
 	}
-	if speakerMatch != 0 {
-		t.Fatalf("speaker_match=%d want 0", speakerMatch)
+	defer rows.Close()
+
+	got := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan conversation id: %v", err)
+		}
+		got = append(got, id)
 	}
-	if empathyRan != 1 {
-		t.Fatalf("empathy_ran=%d want 1", empathyRan)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate conversation ids: %v", err)
 	}
-	if empathyType != "validation" {
-		t.Fatalf("empathy_type=%q want validation", empathyType)
+
+	want := []string{"conv_b", "conv_c"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("conversation ids=%v want %v", got, want)
 	}
 }
 
-func TestMigrate_RejectsInvalidJSONLine(t *testing.T) {
+func TestAnnotateRange_AppendsNewRunDoesNotOverwrite(t *testing.T) {
 	tmp := t.TempDir()
-	in := filepath.Join(tmp, "annotations.jsonl")
+	csvDir := filepath.Join(tmp, "csv")
 	dbPath := filepath.Join(tmp, "annotations.db")
+	mock := newMockOpenAIServer(t)
+	defer mock.Close()
+	mustWriteCSV(t, csvDir, "a.csv", "conv_a")
+	mustWriteCSV(t, csvDir, "b.csv", "conv_b")
 
+	run1, err := AnnotateRangeToSQLite(context.Background(), AnnotateConfig{
+		DBPath:     dbPath,
+		InputDir:   csvDir,
+		FromIdx:    1,
+		ToIdx:      1,
+		ReleaseTag: "r1",
+		Model:      "gpt-4.1-mini",
+		APIKey:     "test_key",
+		BaseURL:    mock.URL,
+		MaxRetries: 0,
+	})
+	if err != nil {
+		t.Fatalf("annotate run1: %v", err)
+	}
+	run2, err := AnnotateRangeToSQLite(context.Background(), AnnotateConfig{
+		DBPath:     dbPath,
+		InputDir:   csvDir,
+		FromIdx:    2,
+		ToIdx:      2,
+		ReleaseTag: "r2",
+		Model:      "gpt-4.1-mini",
+		APIKey:     "test_key",
+		BaseURL:    mock.URL,
+		MaxRetries: 0,
+	})
+	if err != nil {
+		t.Fatalf("annotate run2: %v", err)
+	}
+	if run1 == run2 {
+		t.Fatalf("run ids must differ")
+	}
+
+	db, err := openSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	var runCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM annotation_runs`).Scan(&runCount); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runCount != 2 {
+		t.Fatalf("run count=%d want 2", runCount)
+	}
+
+	var totalRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM annotations`).Scan(&totalRows); err != nil {
+		t.Fatalf("count annotations: %v", err)
+	}
+	if totalRows == 0 {
+		t.Fatalf("expected annotations rows > 0")
+	}
+}
+
+func TestGreenRedReplicaClassification_StrictGate(t *testing.T) {
+	green := analyzedReplicaRow{
+		SpeakerMatch:  true,
+		SpeakerOK:     true,
+		SpeakerErrors: []string{},
+		EmpathyRan:    false,
+	}
+	if !isGreenReplica(green) {
+		t.Fatalf("expected green row")
+	}
+
+	redMismatch := analyzedReplicaRow{
+		SpeakerMatch:  false,
+		SpeakerOK:     true,
+		SpeakerErrors: []string{},
+		EmpathyRan:    false,
+	}
+	if isGreenReplica(redMismatch) {
+		t.Fatalf("expected red row for mismatch")
+	}
+
+	redEmpathy := analyzedReplicaRow{
+		SpeakerMatch:  true,
+		SpeakerOK:     true,
+		SpeakerErrors: []string{},
+		EmpathyRan:    true,
+		EmpathyOK:     false,
+		EmpathyErrors: []string{"format:error"},
+	}
+	if isGreenReplica(redEmpathy) {
+		t.Fatalf("expected red row for empathy errors")
+	}
+}
+
+func TestConversationColor_ComputedFromReplicaColors(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+
+	runID := "run_conversation_color"
+	createdAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	seedRun(t, dbPath, runID, createdAt)
+	seedAnnotation(t, dbPath, runID, "conv_a", 1, true, true, []string{}, false, true, []string{}, "none")
+	seedAnnotation(t, dbPath, runID, "conv_a", 2, false, true, []string{"quality:speaker_mismatch"}, false, true, []string{}, "none")
+	seedAnnotation(t, dbPath, runID, "conv_b", 1, true, true, []string{}, false, true, []string{}, "none")
+
+	report, err := BuildReport(dbPath, runID)
+	if err != nil {
+		t.Fatalf("build report: %v", err)
+	}
+	if report.GreenConversationCount != 1 {
+		t.Fatalf("green conversations=%d want 1", report.GreenConversationCount)
+	}
+	if report.RedConversationCount != 1 {
+		t.Fatalf("red conversations=%d want 1", report.RedConversationCount)
+	}
+}
+
+func TestAnalyticsMarkdown_ContainsCoreSections(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+	runID := "run_analytics"
+	seedRun(t, dbPath, runID, time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339))
+	seedAnnotation(t, dbPath, runID, "conv_a", 1, true, true, []string{}, false, true, []string{}, "none")
+
+	md, err := BuildAnalyticsMarkdown(dbPath, runID)
+	if err != nil {
+		t.Fatalf("build analytics: %v", err)
+	}
+
+	for _, section := range []string{
+		"## Run Metadata",
+		"## Totals",
+		"## Speaker Accuracy",
+		"## Empathy",
+		"## Top Validation Errors",
+	} {
+		if !strings.Contains(md, section) {
+			t.Fatalf("analytics markdown missing section %q", section)
+		}
+	}
+}
+
+func TestDebugMarkdown_ContainsBrokenDialogsAndReasons(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+
+	runID := "run_debug_broken"
+	seedRun(t, dbPath, runID, time.Now().UTC().Add(-2*time.Minute).Format(time.RFC3339))
+	seedAnnotation(t, dbPath, runID, "conv_bad", 1, false, true, []string{"quality:speaker_mismatch"}, false, true, []string{}, "none")
+
+	md, err := BuildReleaseDebugMarkdown(dbPath, runID)
+	if err != nil {
+		t.Fatalf("build debug markdown: %v", err)
+	}
+	if !strings.Contains(md, "## Red Conversations") {
+		t.Fatalf("missing red conversations section")
+	}
+	if !strings.Contains(md, "conv_bad") {
+		t.Fatalf("missing broken conversation id")
+	}
+	if !strings.Contains(md, "speaker_mismatch") {
+		t.Fatalf("missing failure reason")
+	}
+}
+
+func TestDebugMarkdown_ContainsDeltaToPreviousRun(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+
+	seedRun(t, dbPath, "run_prev", time.Now().UTC().Add(-2*time.Hour).Format(time.RFC3339))
+	seedAnnotation(t, dbPath, "run_prev", "conv_a", 1, true, true, []string{}, false, true, []string{}, "none")
+
+	seedRun(t, dbPath, "run_curr", time.Now().UTC().Add(-time.Hour).Format(time.RFC3339))
+	seedAnnotation(t, dbPath, "run_curr", "conv_a", 1, false, true, []string{"quality:speaker_mismatch"}, false, true, []string{}, "none")
+
+	md, err := BuildReleaseDebugMarkdown(dbPath, "run_curr")
+	if err != nil {
+		t.Fatalf("build debug markdown: %v", err)
+	}
+	if !strings.Contains(md, "## Delta vs previous run") {
+		t.Fatalf("missing delta section")
+	}
+	if !strings.Contains(md, "previous_run_id: `run_prev`") {
+		t.Fatalf("missing previous run id")
+	}
+	if !strings.Contains(md, "speaker_accuracy_delta_pp") {
+		t.Fatalf("missing delta metric")
+	}
+}
+
+func TestReportLatestRun_ConsoleMetrics(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "annotations.db")
+	if err := SetupSQLite(dbPath); err != nil {
+		t.Fatalf("setup sqlite: %v", err)
+	}
+
+	seedRun(t, dbPath, "run_report", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339))
+	seedAnnotation(t, dbPath, "run_report", "conv_a", 1, true, true, []string{}, false, true, []string{}, "none")
+
+	report, err := BuildReport(dbPath, "latest")
+	if err != nil {
+		t.Fatalf("build report: %v", err)
+	}
+	text := FormatReport(report)
+
+	for _, item := range []string{
+		"run_id=run_report",
+		"speaker_accuracy_percent=",
+		"green_replicas=",
+		"red_replicas=",
+	} {
+		if !strings.Contains(text, item) {
+			t.Fatalf("report output missing %q", item)
+		}
+	}
+}
+
+func mustWriteCSV(t *testing.T, dir, fileName, conversationID string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir csv dir: %v", err)
+	}
+
+	path := filepath.Join(dir, fileName)
 	content := strings.Join([]string{
-		testJSONLRecord("conv_1", 1, "Sales Rep", "Sales Rep", true, nil, true, true, "support", 0.9),
-		`{"broken_json":`,
+		"Conversation,Chunk_id,Speaker,Text,Embedding",
+		fmt.Sprintf("%s,1,Sales Rep,\"I understand your concern and I can help.\",[]", conversationID),
+		fmt.Sprintf("%s,2,Customer,\"I am not sure this is worth the price.\",[]", conversationID),
 	}, "\n")
-	if err := os.WriteFile(in, []byte(content), 0o644); err != nil {
-		t.Fatalf("write jsonl: %v", err)
-	}
-
-	_, err := MigrateJSONLToSQLite(in, dbPath)
-	if err == nil {
-		t.Fatalf("expected error for invalid line")
-	}
-	if !strings.Contains(err.Error(), "line 2") {
-		t.Fatalf("error=%q want line number", err)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
 	}
 }
 
-func TestReport_ComputesSpeakerAccuracy(t *testing.T) {
-	tmp := t.TempDir()
-	in := filepath.Join(tmp, "annotations.jsonl")
-	dbPath := filepath.Join(tmp, "annotations.db")
-
-	lines := []string{
-		testJSONLRecord("conv_a", 1, "Sales Rep", "Sales Rep", true, nil, true, true, "support", 0.9),
-		testJSONLRecord("conv_a", 2, "Customer", "Customer", true, nil, false, false, "none", 0),
-		testJSONLRecord("conv_b", 1, "Sales Rep", "Customer", true, []string{"quality:speaker_mismatch"}, true, true, "validation", 0.8),
+func assertTableExists(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?`, table).Scan(&count); err != nil {
+		t.Fatalf("check table %s: %v", table, err)
 	}
-	if err := os.WriteFile(in, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
-		t.Fatalf("write jsonl: %v", err)
+	if count == 0 {
+		t.Fatalf("table not found: %s", table)
 	}
+}
 
-	if _, err := MigrateJSONLToSQLite(in, dbPath); err != nil {
-		t.Fatalf("migrate: %v", err)
+func assertIndexExists(t *testing.T, db *sql.DB, index string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?`, index).Scan(&count); err != nil {
+		t.Fatalf("check index %s: %v", index, err)
 	}
+	if count == 0 {
+		t.Fatalf("index not found: %s", index)
+	}
+}
 
-	report, err := BuildReport(dbPath)
+func seedRun(t *testing.T, dbPath, runID, createdAt string) {
+	t.Helper()
+	db, err := openSQLite(dbPath)
 	if err != nil {
-		t.Fatalf("build report: %v", err)
+		t.Fatalf("open sqlite: %v", err)
 	}
+	defer db.Close()
 
-	if report.TotalRows != 3 {
-		t.Fatalf("total rows=%d want 3", report.TotalRows)
-	}
-	if report.SpeakerMatchCount != 2 {
-		t.Fatalf("speaker match=%d want 2", report.SpeakerMatchCount)
-	}
-	if report.QualitySpeakerMismatchCount != 1 {
-		t.Fatalf("quality mismatch count=%d want 1", report.QualitySpeakerMismatchCount)
-	}
-	if report.TotalConversations != 2 {
-		t.Fatalf("total conversations=%d want 2", report.TotalConversations)
+	if _, err := db.Exec(insertRunSQL,
+		runID,
+		"seed",
+		createdAt,
+		"seed_input",
+		1,
+		1,
+		"seed_model",
+		1,
+		1,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
 	}
 }
 
-func TestReport_EmptahyDistribution(t *testing.T) {
-	tmp := t.TempDir()
-	in := filepath.Join(tmp, "annotations.jsonl")
-	dbPath := filepath.Join(tmp, "annotations.db")
-
-	lines := []string{
-		testJSONLRecord("conv_a", 1, "Sales Rep", "Sales Rep", true, nil, true, true, "support", 0.9),
-		testJSONLRecord("conv_a", 2, "Customer", "Customer", true, nil, false, false, "none", 0),
-		testJSONLRecord("conv_b", 1, "Sales Rep", "Sales Rep", true, nil, true, true, "validation", 0.6),
-	}
-	if err := os.WriteFile(in, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
-		t.Fatalf("write jsonl: %v", err)
-	}
-
-	if _, err := MigrateJSONLToSQLite(in, dbPath); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-
-	report, err := BuildReport(dbPath)
-	if err != nil {
-		t.Fatalf("build report: %v", err)
-	}
-
-	distribution := map[string]int{}
-	for _, item := range report.EmpathyTypeDistribution {
-		distribution[item.Type] = item.Count
-	}
-	if distribution["support"] != 1 || distribution["validation"] != 1 || distribution["none"] != 1 {
-		t.Fatalf("unexpected empathy distribution: %+v", distribution)
-	}
-	if report.EmpathyRanCount != 2 {
-		t.Fatalf("empathy_ran=%d want 2", report.EmpathyRanCount)
-	}
-	if report.EmpathyPresentCount != 2 {
-		t.Fatalf("empathy_present=%d want 2", report.EmpathyPresentCount)
-	}
-}
-
-func TestBusinessProcess_RoutingForEmpathy(t *testing.T) {
-	speaker := &fakeSpeakerCase{
-		result: ReplicaCaseResult{
-			PredictedSpeaker: "Customer",
-			Confidence:       0.8,
-			EvidenceQuote:    "quote",
-		},
-	}
-	empathy := &fakeEmpathyCase{
-		result: EmpathyCaseResult{
-			Ran:            true,
-			EmpathyPresent: true,
-			EmpathyType:    "support",
-			Confidence:     0.9,
-			EvidenceQuote:  "quote",
-		},
-	}
-
-	process := AnnotationBusinessProcess{
-		SpeakerCase: speaker,
-		EmpathyCase: empathy,
-	}
-
-	outCustomer, err := process.Run(context.Background(), ProcessInput{
-		ReplicaText: "hello",
-		SpeakerTrue: "Customer",
-	})
-	if err != nil {
-		t.Fatalf("run customer: %v", err)
-	}
-	if outCustomer.Empathy.Ran {
-		t.Fatalf("expected empathy skip for customer")
-	}
-	if empathy.calls != 0 {
-		t.Fatalf("empathy calls=%d want 0", empathy.calls)
-	}
-
-	outSales, err := process.Run(context.Background(), ProcessInput{
-		ReplicaText: "hello",
-		SpeakerTrue: "Sales Rep",
-	})
-	if err != nil {
-		t.Fatalf("run sales rep: %v", err)
-	}
-	if !outSales.Empathy.Ran {
-		t.Fatalf("expected empathy run for sales rep")
-	}
-	if empathy.calls != 1 {
-		t.Fatalf("empathy calls=%d want 1", empathy.calls)
-	}
-}
-
-type fakeSpeakerCase struct {
-	result ReplicaCaseResult
-	err    error
-}
-
-func (f *fakeSpeakerCase) Evaluate(ctx context.Context, in ReplicaCaseInput) (ReplicaCaseResult, error) {
-	if f.err != nil {
-		return ReplicaCaseResult{}, f.err
-	}
-	return f.result, nil
-}
-
-type fakeEmpathyCase struct {
-	result EmpathyCaseResult
-	err    error
-	calls  int
-}
-
-func (f *fakeEmpathyCase) Evaluate(ctx context.Context, in EmpathyCaseInput) (EmpathyCaseResult, error) {
-	f.calls++
-	if f.err != nil {
-		return EmpathyCaseResult{}, f.err
-	}
-	return f.result, nil
-}
-
-func testJSONLRecord(
-	conversationID string,
+func seedAnnotation(
+	t *testing.T,
+	dbPath, runID, conversationID string,
 	replicaID int,
-	speakerTrue string,
-	predictedSpeaker string,
+	speakerMatch bool,
 	speakerOK bool,
-	speakerValidationErrors []string,
+	speakerErrors []string,
 	empathyRan bool,
-	empathyPresent bool,
+	empathyOK bool,
+	empathyErrors []string,
 	empathyType string,
-	empathyConfidence float64,
-) string {
-	if speakerValidationErrors == nil {
-		speakerValidationErrors = []string{}
+) {
+	t.Helper()
+	db, err := openSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	speakerPredicted := speakerCustomer
+	if speakerMatch {
+		speakerPredicted = speakerSalesRep
+	}
+	if strings.TrimSpace(empathyType) == "" {
+		empathyType = "none"
 	}
 
-	empathyEvidence := "[]"
-	if empathyPresent {
-		empathyEvidence = `[{"quote":"I understand"}]`
-	}
-	return fmt.Sprintf(
-		`{"conversation_id":"%s","replica_id":%d,"speaker_true":"%s","replica_text":"sample text","turn_ids":[1,2],"guided":{"unit_speaker":{"ok":%t,"attempts":1,"validation_errors":%s,"output":{"predicted_speaker":"%s","confidence":0.9,"evidence":{"quote":"sample"}}},"unit_empathy":{"ran":%t,"ok":true,"attempts":1,"validation_errors":[],"output":{"empathy_present":%t,"empathy_type":"%s","confidence":%v,"evidence":%s}}},"meta":{"model":"gpt-4.1-mini","timestamp_utc":"2026-02-08T10:00:00Z","openai_request_ids":["req1"]}}`,
+	if _, err := db.Exec(insertAnnotationSQL,
+		runID,
 		conversationID,
 		replicaID,
-		speakerTrue,
-		speakerOK,
-		marshalStringArray(speakerValidationErrors),
-		predictedSpeaker,
-		empathyRan,
-		empathyPresent,
+		speakerSalesRep,
+		speakerPredicted,
+		boolToInt(speakerMatch),
+		boolToInt(speakerOK),
+		1,
+		mustJSON(speakerErrors),
+		mustJSON(map[string]any{
+			"predicted_speaker": speakerPredicted,
+			"confidence":        0.8,
+			"evidence":          map[string]string{"quote": "sample"},
+		}),
+		boolToInt(empathyRan),
+		boolToInt(empathyOK),
+		0,
 		empathyType,
-		empathyConfidence,
-		empathyEvidence,
-	)
+		0.7,
+		boolToInt(empathyRan),
+		mustJSON(empathyErrors),
+		mustJSON(map[string]any{
+			"empathy_present": false,
+			"empathy_type":    empathyType,
+			"confidence":      0.7,
+			"evidence":        []any{},
+		}),
+		"sample text",
+		mustJSON([]int{1}),
+		"seed_model",
+		time.Now().UTC().Format(time.RFC3339),
+		"[]",
+	); err != nil {
+		t.Fatalf("seed annotation: %v", err)
+	}
 }
 
-func TestOpenSQLite_EmptyPath(t *testing.T) {
-	_, err := openSQLite("")
-	if err == nil {
-		t.Fatalf("expected error for empty path")
-	}
+func newMockOpenAIServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	currentTextRegex := regexp.MustCompile(`current: "(.*?)"`)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("unmarshal request: %v", err)
+		}
+
+		currentText := ""
+		for _, m := range req.Messages {
+			if m.Role != "user" {
+				continue
+			}
+			matches := currentTextRegex.FindStringSubmatch(m.Content)
+			if len(matches) >= 2 {
+				currentText = matches[1]
+				break
+			}
+		}
+
+		predicted := speakerSalesRep
+		if strings.Contains(strings.ToLower(currentText), "not sure") ||
+			strings.Contains(strings.ToLower(currentText), "worth the price") {
+			predicted = speakerCustomer
+		}
+
+		quote := "I"
+		if strings.Contains(currentText, "I understand") {
+			quote = "I understand"
+		} else if strings.Contains(currentText, "I am") {
+			quote = "I am"
+		}
+
+		content := mustJSON(map[string]any{
+			"predicted_speaker": predicted,
+			"confidence":        0.9,
+			"evidence": map[string]string{
+				"quote": quote,
+			},
+		})
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"content": content,
+						"refusal": "",
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("x-request-id", "req_test_1")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	})
+
+	return httptest.NewServer(handler)
 }
