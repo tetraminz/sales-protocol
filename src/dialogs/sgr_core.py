@@ -1,25 +1,31 @@
 from __future__ import annotations
 
-"""Core-бизнес логика SGR.
+"""Core SGR-логика для оценки качества реплик продаж.
 
-Этот модуль - единая точка, где зафиксированы:
-- бизнес-правила оценки продавца;
-- политика prompt-ов evaluator/judge;
-- проверки evidence и soft-флаги консистентности judge.
+Роль модуля в пайплайне:
+- задает стабильный бизнес-контракт правил (`greeting`, `upsell`, `empathy`);
+- задает пороги качества для heatmap и отчетов;
+- формирует prompt-шаблоны evaluator/judge;
+- фиксирует quote-contract как обязательное условие доказуемости.
+
+Границы ответственности:
+- здесь нет SQL, сетевых вызовов и файловых операций;
+- модуль только описывает правила, инварианты и чистые helper-функции.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 import json
-import re
 
-from .models import EvaluatorResult, JudgeResult, ReasonCode
+from .models import BundledEvaluatorResult, BundledJudgeResult, ReasonCode, RuleEvaluation, RuleJudgeEvaluation
 
-METRICS_VERSION = "v3_minimal_judge_correctness"
+METRICS_VERSION = "v4_bundled_full_judge"
 
 
 @dataclass(frozen=True)
 class RuleCard:
+    """Карточка бизнес-правила оценки реплики продавца."""
+
     key: str
     title_ru: str
     what_to_check: str
@@ -28,36 +34,39 @@ class RuleCard:
 
 @dataclass(frozen=True)
 class QualityThresholds:
+    """Пороги зон качества в отчетах и executive-визуализации."""
+
     green_min: float = 0.90
     yellow_min: float = 0.80
     rule_alert_min: float = 0.85
-    judge_coverage_min: float = 0.98
+    judge_coverage_min: float = 1.0
 
 
-# Бизнес-каталог правил намеренно жесткий: это контракт системы и тестов.
 RULES: tuple[RuleCard, ...] = (
     RuleCard(
         key="greeting",
         title_ru="Приветствие",
-        what_to_check="Есть в сообщении продавца явное приветствие клиенту.",
-        why_it_matters="Первое касание задает тон диалога и влияет на доверие.",
+        what_to_check="Есть в реплике продавца явное приветствие клиенту.",
+        why_it_matters="Первое касание задает тон и влияет на доверие.",
     ),
     RuleCard(
         key="upsell",
         title_ru="Допродажа",
-        what_to_check="Есть предложение доп. опции/тарифа/пакета, уместное контексту.",
+        what_to_check="Есть уместное предложение следующего платного шага.",
         why_it_matters="Рост среднего чека без потери качества общения.",
     ),
     RuleCard(
         key="empathy",
         title_ru="Эмпатия",
-        what_to_check="По контексту диалога эмпатия уместна и в реплике продавца выражена явно.",
-        why_it_matters="Контекстная эмпатия снижает трение и повышает шанс конструктивного шага клиента.",
+        what_to_check="В контексте есть явное признание ситуации клиента.",
+        why_it_matters="Снижает трение и повышает шанс конструктивного ответа клиента.",
     ),
 )
 
+# Централизованные пороги для heatmap/report.
 QUALITY_THRESHOLDS = QualityThresholds()
 
+# Бизнес-правила для оценки каждой реплики продавца.
 RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
     "greeting": ("greeting_present", "greeting_missing"),
     "upsell": ("upsell_offer", "upsell_missing", "discount_without_upsell"),
@@ -67,7 +76,7 @@ RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
 RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
     "upsell": (
         "Скидка/промокод без новой опции не считается допродажей.",
-        "Информирование о статусе без следующего платного шага не является upsell.",
+        "Статус/инфо-ответ без платного следующего шага не считается upsell.",
     ),
     "empathy": (
         "Вежливость и small talk не равны эмпатии.",
@@ -75,20 +84,29 @@ RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Эти маркеры участвуют только в мягкой проверке противоречий rationale.
-_POSITIVE_RATIONALE_MARKERS = ("оценка корректна", "evaluator корректно", "assessment is correct")
-_NEGATIVE_RATIONALE_MARKERS = ("некоррект", "ошиб", "incorrect")
 
-
+# Блок доступа к контракту правил и порогов.
 def all_rules() -> tuple[RuleCard, ...]:
+    """Возвращает фиксированный набор бизнес-правил."""
+
     return RULES
 
 
+def rule_keys() -> tuple[str, ...]:
+    """Возвращает стабильный порядок ключей правил."""
+
+    return tuple(rule.key for rule in RULES)
+
+
 def quality_thresholds() -> QualityThresholds:
+    """Возвращает централизованные пороги зон качества."""
+
     return QUALITY_THRESHOLDS
 
 
 def heatmap_zone(score: float | None, *, thresholds: QualityThresholds | None = None) -> str:
+    """Классифицирует score в `green/yellow/red/na`."""
+
     cfg = thresholds or QUALITY_THRESHOLDS
     if score is None:
         return "na"
@@ -100,6 +118,8 @@ def heatmap_zone(score: float | None, *, thresholds: QualityThresholds | None = 
 
 
 def threshold_doc_line(*, thresholds: QualityThresholds | None = None) -> str:
+    """Форматирует строку порогов для markdown-отчетов."""
+
     cfg = thresholds or QUALITY_THRESHOLDS
     return (
         f"green >= {cfg.green_min:.2f}, "
@@ -108,189 +128,218 @@ def threshold_doc_line(*, thresholds: QualityThresholds | None = None) -> str:
     )
 
 
+# Блок распознавания ролей сообщений.
 def is_seller_message(speaker_label: str) -> bool:
+    """True только для реплик продавца."""
+
     return speaker_label == "Sales Rep"
 
 
-def build_chat_context(conversation_messages: Sequence[object], *, current_message_order: int) -> str:
-    # Контекст для evaluator/judge: только сообщения до текущего шага включительно.
-    lines: list[str] = []
-    for item in conversation_messages:
+def is_customer_message(speaker_label: str) -> bool:
+    """True только для реплик покупателя."""
+
+    return speaker_label == "Customer"
+
+
+def _ordered_messages(conversation_messages: Sequence[object]) -> list[object]:
+    return sorted(conversation_messages, key=lambda item: int(item["message_order"]))  # type: ignore[index]
+
+
+# Блок построения контекста вокруг текущей seller-реплики.
+def previous_customer_message(
+    conversation_messages: Sequence[object], *, current_message_order: int
+) -> object | None:
+    """Возвращает ближайшую предыдущую реплику покупателя перед текущей seller-репликой."""
+
+    candidate: object | None = None
+    for item in _ordered_messages(conversation_messages):
         order = int(item["message_order"])  # type: ignore[index]
-        if order > int(current_message_order):
-            continue
-        speaker = str(item["speaker_label"])  # type: ignore[index]
-        text = str(item["text"])  # type: ignore[index]
-        lines.append(f"[{order}] {speaker}: {text}")
+        if order >= int(current_message_order):
+            break
+        if is_customer_message(str(item["speaker_label"])):  # type: ignore[index]
+            candidate = item
+    return candidate
+
+
+def build_chat_context(
+    conversation_messages: Sequence[object],
+    *,
+    current_message_order: int,
+    mode: str = "full",
+) -> str:
+    """Собирает контекст для evaluator/judge.
+
+    - `full`: все сообщения до текущего включительно.
+    - `turn`: последняя реплика Customer + текущая реплика Sales Rep.
+    """
+
+    if mode not in {"full", "turn"}:
+        raise ValueError(f"unknown context mode: {mode}")
+
+    ordered = _ordered_messages(conversation_messages)
+    if mode == "full":
+        lines: list[str] = []
+        for item in ordered:
+            order = int(item["message_order"])  # type: ignore[index]
+            if order > int(current_message_order):
+                continue
+            speaker = str(item["speaker_label"])  # type: ignore[index]
+            text = str(item["text"])  # type: ignore[index]
+            lines.append(f"[{order}] {speaker}: {text}")
+        return "\n".join(lines)
+
+    seller_item = None
+    for item in ordered:
+        if int(item["message_order"]) == int(current_message_order):  # type: ignore[index]
+            seller_item = item
+            break
+    if seller_item is None:
+        raise ValueError(f"current_message_order not found: {current_message_order}")
+
+    previous_customer = previous_customer_message(
+        ordered,
+        current_message_order=int(current_message_order),
+    )
+    lines = []
+    if previous_customer is not None:
+        lines.append(f"Customer: {str(previous_customer['text'])}")  # type: ignore[index]
+    lines.append(f"Sales Rep: {str(seller_item['text'])}")  # type: ignore[index]
     return "\n".join(lines)
 
 
+# Внутренние helper-форматтеры prompt-контента.
 def _reason_codes_for_rule(rule_key: str) -> str:
     values = RULE_REASON_CODES.get(rule_key, ())
     return ", ".join(f"`{value}`" for value in values)
 
 
-def default_reason_code(rule_key: str, *, hit: bool) -> ReasonCode:
-    # Фолбэк нужен для единичных случаев, когда evaluator payload отсутствует в кэше.
-    if rule_key == "greeting":
-        return "greeting_present" if hit else "greeting_missing"
-    if rule_key == "upsell":
-        return "upsell_offer" if hit else "upsell_missing"
-    return "empathy_acknowledged" if hit else "informational_without_empathy"
-
-
-def _rule_anti_patterns(rule_key: str) -> str:
-    patterns = RULE_ANTI_PATTERNS.get(rule_key, ())
-    if not patterns:
+def _anti_patterns_for_rule(rule_key: str) -> str:
+    values = RULE_ANTI_PATTERNS.get(rule_key, ())
+    if not values:
         return ""
-    return "\n".join(f"- {item}" for item in patterns)
+    return "\n".join(f"- {item}" for item in values)
 
 
-def build_evaluator_prompts(
-    rule: RuleCard,
+# Блок сборки prompt-ов evaluator/judge.
+def build_evaluator_prompts_bundle(
+    rules: Sequence[RuleCard],
     *,
-    speaker_label: str,
-    text: str,
-    message_id: int,
+    seller_message_id: int,
+    seller_text: str,
+    customer_text: str,
     chat_context: str,
+    context_mode: str,
 ) -> tuple[str, str]:
-    anti_patterns = _rule_anti_patterns(rule.key)
+    """Формирует bundled-prompt evaluator: один вызов на реплику, все правила сразу."""
+
+    # Quote-contract: это обязательное бизнес-условие доказуемости.
+    # Для hit=true evaluator обязан вернуть не смысловой пересказ, а буквальный фрагмент seller_text.
     system_prompt = (
         "Ты evaluator качества продаж. "
-        "Верни только JSON по строгой схеме. "
-        "Решение для empathy принимай только по chat context. "
-        "Используй reason_code из разрешенного списка для текущего rule_key. "
-        "reason пиши на русском; evidence.quote оставляй точной цитатой из исходного текста без перевода."
+        "Верни только JSON по схеме BundledEvaluatorResult. "
+        "Оцени greeting/upsell/empathy отдельно. "
+        "reason пиши на русском. "
+        "Quote-contract обязателен: evidence_quote для hit=true должен быть дословной непустой "
+        "contiguous подстрокой seller_text, символ-в-символ, на том же языке. "
+        "Нельзя переводить, перефразировать, менять пунктуацию и кавычки. "
+        "Для hit=false допускается пустой evidence_quote."
     )
-    user_prompt = (
-        f"Правило: {rule.key} ({rule.title_ru})\n"
-        f"Что проверяем: {rule.what_to_check}\n"
-        f"Зачем: {rule.why_it_matters}\n"
-        f"Сообщение: message_id={message_id}, speaker={speaker_label}, text={text}\n"
-        "Контекст чата до текущего сообщения:\n"
-        f"{chat_context}\n"
-        "Ограничения evidence для hit=true:\n"
-        "- evidence.message_id обязан быть равен message_id\n"
-        "- evidence.quote обязан быть точной подстрокой text\n"
-        "- evidence.span_start/evidence.span_end обязаны указывать точные границы quote в text\n"
-        "- проверка: evidence.quote == text[evidence.span_start:evidence.span_end]\n"
-        f"Разрешенные reason_code для этого правила: {_reason_codes_for_rule(rule.key)}\n"
+
+    lines = [
+        f"seller_message_id={int(seller_message_id)}",
+        f"context_mode={context_mode}",
+        f"customer_text={customer_text}",
+        "BEGIN_SELLER_TEXT",
+        seller_text,
+        "END_SELLER_TEXT",
+        "Контекст чата до текущей реплики:",
+        chat_context,
+        "",
+        "Правила для оценки:",
+    ]
+    for rule in rules:
+        lines.extend(
+            [
+                f"- {rule.key} ({rule.title_ru})",
+                f"  что проверяем: {rule.what_to_check}",
+                f"  зачем это бизнесу: {rule.why_it_matters}",
+                f"  reason_code: {_reason_codes_for_rule(rule.key)}",
+            ]
+        )
+        anti = _anti_patterns_for_rule(rule.key)
+        if anti:
+            lines.append("  антипаттерны:")
+            for item in anti.splitlines():
+                lines.append(f"  {item}")
+    lines.extend(
+        [
+            "",
+            "Проверь доказуемость:",
+            "- если hit=true, evidence_quote обязан быть непустой дословной contiguous подстрокой seller_text;",
+            "- language evidence_quote должен совпадать с language seller_text;",
+            "- перевод/перефраз/улучшение формулировки evidence_quote недопустимы;",
+            "- если hit=false, reason и reason_code все равно обязательны.",
+        ]
     )
-    if anti_patterns:
-        user_prompt += f"Антипаттерны для {rule.key}:\n{anti_patterns}\n"
-    user_prompt += "Если hit=false, reason и reason_code все равно обязательны.\n"
-    return system_prompt, user_prompt
+    return system_prompt, "\n".join(lines)
 
 
-def build_judge_prompts(
-    rule: RuleCard,
+def build_judge_prompts_bundle(
+    rules: Sequence[RuleCard],
     *,
-    speaker_label: str,
-    text: str,
+    seller_text: str,
+    customer_text: str,
     chat_context: str,
-    evaluator: EvaluatorResult,
+    evaluator: BundledEvaluatorResult,
+    context_mode: str,
 ) -> tuple[str, str]:
+    """Формирует bundled-prompt judge: один вызов на реплику, все правила сразу."""
+
     system_prompt = (
         "Ты независимый judge качества. "
-        "Сначала определи expected_hit по правилу и контексту. "
-        "Затем проверь корректность evaluator: label=true только если evaluator.hit == expected_hit. "
-        "Верни только JSON по схеме JudgeResult. "
-        "rationale пиши на русском; допускаются только дословные цитаты из исходного текста."
-    )
-    user_prompt = (
-        f"Правило: {rule.key} ({rule.title_ru})\n"
-        f"Критерий: {rule.what_to_check}\n"
-        f"Сообщение: speaker={speaker_label}, text={text}\n"
-        "Контекст чата до текущего сообщения:\n"
-        f"{chat_context}\n"
-        "Ответ evaluator (JSON):\n"
-        f"{json.dumps(evaluator.model_dump(), ensure_ascii=False)}\n"
-        "Инструкция:\n"
-        "- expected_hit: твоя независимая оценка\n"
-        "- label=true, если evaluator корректен; иначе false\n"
-        "- rationale: кратко и без противоречий к label"
-    )
-    return system_prompt, user_prompt
-
-
-def build_evidence_correction_note(message_id: int) -> str:
-    return (
-        "Коррекция evidence:\n"
-        f"- evidence.message_id должен быть равен {int(message_id)}\n"
-        "- evidence.quote должен быть точной подстрокой текущего text\n"
-        "- выставь evidence.span_start/evidence.span_end точно по границам quote в text\n"
-        "- проверка: evidence.quote == text[evidence.span_start:evidence.span_end]\n"
-        "- верни JSON строго по той же схеме"
+        "Для каждого правила сначала вычисли expected_hit по контексту, "
+        "затем выставь label=true только если evaluator.hit совпал с expected_hit. "
+        "Верни только JSON по схеме BundledJudgeResult. "
+        "rationale пиши кратко на русском."
     )
 
-
-def normalize_evidence_span(result: EvaluatorResult, *, text: str) -> EvaluatorResult:
-    # Авто-фикс безопасен только когда quote корректный, а ошибка только в индексах.
-    if not result.hit:
-        return result
-
-    evidence = result.evidence
-    quote = evidence.quote.strip()
-    if not quote:
-        return result
-
-    if 0 <= evidence.span_start <= evidence.span_end <= len(text):
-        if text[evidence.span_start : evidence.span_end] == quote:
-            return result
-
-    start = text.find(quote)
-    if start < 0:
-        return result
-    end = start + len(quote)
-    if start == evidence.span_start and end == evidence.span_end:
-        return result
-    return result.model_copy(
-        update={
-            "evidence": evidence.model_copy(
-                update={
-                    "span_start": start,
-                    "span_end": end,
-                }
-            )
-        }
+    lines = [
+        f"context_mode={context_mode}",
+        f"customer_text={customer_text}",
+        f"seller_text={seller_text}",
+        "Контекст чата до текущей реплики:",
+        chat_context,
+        "",
+        "Правила для проверки:",
+    ]
+    for rule in rules:
+        lines.append(f"- {rule.key}: {rule.what_to_check}")
+    lines.extend(
+        [
+            "",
+            "Ответ evaluator (JSON):",
+            json.dumps(evaluator.model_dump(), ensure_ascii=False),
+        ]
     )
+    return system_prompt, "\n".join(lines)
 
 
-def evidence_error(result: EvaluatorResult, *, message_id: int, text: str) -> str | None:
-    if not result.hit:
-        return None
+# Блок маппинга bundled payload в rule-key словари.
+def evaluator_results_by_rule(result: BundledEvaluatorResult) -> dict[str, RuleEvaluation]:
+    """Удобный доступ к bundled evaluator-результатам по ключу правила."""
 
-    evidence = result.evidence
-    quote = evidence.quote.strip()
-    if not quote:
-        return "evidence.quote пустой при hit=true"
-    if evidence.message_id != int(message_id):
-        return (
-            "evidence.message_id не совпадает с текущим message_id: "
-            f"{evidence.message_id} != {int(message_id)}"
-        )
-    if evidence.span_end <= evidence.span_start:
-        return "evidence.span_end должен быть > evidence.span_start"
-    if evidence.span_end > len(text):
-        return "evidence.span_end выходит за длину message.text"
-
-    span_text = text[evidence.span_start : evidence.span_end]
-    if quote != span_text:
-        return "evidence.quote не совпадает с text[span_start:span_end]"
-    return None
+    return {
+        "greeting": result.greeting,
+        "upsell": result.upsell,
+        "empathy": result.empathy,
+    }
 
 
-def judge_inconsistency_flags(*, evaluator_hit: bool, judge: JudgeResult) -> list[str]:
-    flags: list[str] = []
-    expected_label = evaluator_hit == judge.expected_hit
-    if bool(judge.label) != bool(expected_label):
-        flags.append("label_expected_hit_mismatch")
+def judge_results_by_rule(result: BundledJudgeResult) -> dict[str, RuleJudgeEvaluation]:
+    """Удобный доступ к bundled judge-результатам по ключу правила."""
 
-    rationale = re.sub(r"\s+", " ", judge.rationale.lower()).strip()
-    if not rationale:
-        return flags
-    if not judge.label and any(marker in rationale for marker in _POSITIVE_RATIONALE_MARKERS):
-        flags.append("label_rationale_positive_contradiction")
-    if judge.label and any(marker in rationale for marker in _NEGATIVE_RATIONALE_MARKERS):
-        flags.append("label_rationale_negative_contradiction")
-    return flags
+    return {
+        "greeting": result.greeting,
+        "upsell": result.upsell,
+        "empathy": result.empathy,
+    }

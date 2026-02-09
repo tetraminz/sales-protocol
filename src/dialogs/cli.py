@@ -10,7 +10,6 @@ from .ingest import ingest_csv_dir
 from .llm import LLMClient
 from .pipeline import build_report, run_scan
 
-
 def _conn(db_path: str) -> sqlite3.Connection:
     return connect(db_path)
 

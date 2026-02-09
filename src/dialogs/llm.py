@@ -105,6 +105,8 @@ class LLMClient:
         except Exception as exc:
             error_message = f"schema_contract_failed: {exc}"
             is_schema_error = True
+            response_json = jdump({"provider": "openai", "error": error_message})
+            extracted = jdump({"error": error_message})
 
         request_payload: dict[str, Any] = {
             "model": self.model,
@@ -122,11 +124,14 @@ class LLMClient:
             },
         }
 
+        prompt_chars = len(system_prompt) + len(user_prompt)
+
         if not error_message:
             if self._client is None:
                 error_message = "live_call_failed: OPENAI_API_KEY is not set"
                 is_live_error = True
                 response_json = jdump({"provider": "openai", "error": error_message})
+                extracted = jdump({"error": error_message})
             else:
                 try:
                     response = self._client.responses.create(**request_payload)
@@ -142,6 +147,7 @@ class LLMClient:
                     is_live_error = True
                     is_schema_error = _looks_like_schema_error(error_message)
                     response_json = jdump({"provider": "openai", "error": error_message})
+                    extracted = jdump({"error": error_message})
 
         payload: Any | None = None
         if not error_message:
@@ -160,14 +166,23 @@ class LLMClient:
                 error_message = f"validation_failed: {exc.errors()}"
                 is_schema_error = True
 
+        response_chars = len(extracted)
         latency_ms = int((time.time() - started) * 1000)
+
+        # Audit trace is always full in v3 stabilization mode.
+        trace_mode = "full"
+        stored_request = jdump(request_payload)
+        stored_response = response_json
+        stored_extracted = extracted
+
         conn.execute(
             """
             INSERT INTO llm_calls(
               run_id, phase, rule_key, conversation_id, message_id, attempt,
+              context_mode, judge_policy, trace_mode, prompt_chars, response_chars,
               request_json, response_http_status, response_json, extracted_json,
               parse_ok, validation_ok, error_message, latency_ms, created_at_utc
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -176,10 +191,15 @@ class LLMClient:
                 conversation_id,
                 int(message_id),
                 int(attempt),
-                jdump(request_payload),
+                "full",
+                "full",
+                trace_mode,
+                int(prompt_chars),
+                int(response_chars),
+                stored_request,
                 int(response_http_status),
-                response_json,
-                extracted,
+                stored_response,
+                stored_extracted,
                 1 if parse_ok else 0,
                 1 if validation_ok else 0,
                 error_message,

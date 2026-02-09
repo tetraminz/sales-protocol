@@ -7,7 +7,7 @@ VENV_PY ?= .venv/bin/python
 PY ?= $(VENV_PY)
 PYPATH ?= PYTHONPATH=src
 
-.PHONY: setup init-fresh reset-runs scan report demo stats test notebook
+.PHONY: setup init-fresh reset-runs scan report demo stats test notebook docs
 
 setup:
 	[ -x "$(VENV_PY)" ] || python3 -m venv .venv
@@ -24,7 +24,11 @@ reset-runs:
 	$(PYPATH) $(PY) -m dialogs.main db reset-runs --db "$(DB)"
 
 scan:
-	$(PYPATH) $(PY) -m dialogs.main run scan --db "$(DB)" --model "$(MODEL)" --conversation-from "$(CONVERSATION_FROM)" --conversation-to "$(CONVERSATION_TO)"
+	$(PYPATH) $(PY) -m dialogs.main run scan \
+		--db "$(DB)" \
+		--model "$(MODEL)" \
+		--conversation-from "$(CONVERSATION_FROM)" \
+		--conversation-to "$(CONVERSATION_TO)"
 
 report:
 	$(PYPATH) $(PY) -m dialogs.main run report --db "$(DB)" --md artifacts/metrics.md --png artifacts/accuracy_diff.png
@@ -40,3 +44,7 @@ test:
 
 notebook:
 	$(PY) -m jupyter lab
+
+docs:
+	$(PYPATH) $(PY) -m dialogs.docs_refresh refresh --db "$(DB)" --csv-dir "$(CSV_DIR)" --conversation-from "$(CONVERSATION_FROM)" --conversation-to "$(CONVERSATION_TO)" --md artifacts/metrics.md --png artifacts/accuracy_diff.png
+	$(PYPATH) $(PY) -m dialogs.docs_refresh check --db "$(DB)" --csv-dir "$(CSV_DIR)" --conversation-from "$(CONVERSATION_FROM)" --conversation-to "$(CONVERSATION_TO)" --md artifacts/metrics.md --png artifacts/accuracy_diff.png
