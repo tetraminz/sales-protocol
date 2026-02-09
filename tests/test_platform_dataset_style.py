@@ -11,7 +11,7 @@ from dialogs.db import connect, get_state, init_db
 from dialogs.ingest import ingest_csv_dir
 from dialogs.llm import CallResult, LLMClient
 from dialogs.models import Evidence, EvaluatorResult, JudgeResult
-from dialogs.pipeline import build_report, run_scan
+from dialogs.pipeline import _build_accuracy_heatmap_data, _heatmap_zone, build_report, run_scan
 from dialogs.sgr_core import all_rules, evidence_error
 
 
@@ -389,6 +389,43 @@ def test_judge_phase_updates_existing_rows_and_no_duplicates_dataset_style(db_pa
     assert unique_rows == total
 
 
+def test_heatmap_zone_thresholds_dataset_style() -> None:
+    assert _heatmap_zone(None) == "na"
+    assert _heatmap_zone(0.90) == "green"
+    assert _heatmap_zone(0.70) == "yellow"
+    assert _heatmap_zone(0.6999) == "red"
+
+
+def test_heatmap_data_ordering_and_na_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=1)
+        first_conv = str(
+            conn.execute(
+                "SELECT conversation_id FROM scan_results WHERE run_id=? ORDER BY conversation_id LIMIT 1",
+                (run_id,),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            "UPDATE scan_results SET judge_label=NULL WHERE run_id=? AND conversation_id=? AND rule_key='greeting'",
+            (run_id, first_conv),
+        )
+        conn.commit()
+
+        rule_keys = [rule.key for rule in all_rules()]
+        heatmap = _build_accuracy_heatmap_data(conn, run_id=run_id, rule_keys=rule_keys)
+
+    conversation_ids = [str(x) for x in heatmap["conversation_ids"]]
+    assert conversation_ids == sorted(conversation_ids)
+    assert [str(x) for x in heatmap["rule_keys"]] == rule_keys
+
+    row_idx = conversation_ids.index(first_conv)
+    col_idx = rule_keys.index("greeting")
+    assert int(heatmap["judged_totals"][row_idx][col_idx]) == 0
+    assert heatmap["scores"][row_idx][col_idx] is None
+
+
 def test_canonical_first_run_and_delta_report_dataset_style(db_path: Path, csv_dir: Path, tmp_path: Path) -> None:
     init_db(str(db_path))
     with connect(str(db_path)) as conn:
@@ -403,6 +440,16 @@ def test_canonical_first_run_and_delta_report_dataset_style(db_path: Path, csv_d
         report = build_report(conn, run_id=second_run, md_path=str(md_path), png_path=str(png_path))
 
         md_text = md_path.read_text(encoding="utf-8")
+        heatmap = _build_accuracy_heatmap_data(
+            conn,
+            run_id=second_run,
+            rule_keys=[rule.key for rule in all_rules()],
+        )
+        zones = {
+            _heatmap_zone(score)
+            for row in heatmap["scores"]
+            for score in row
+        }
 
     assert canonical == first_run
     assert canonical_after == first_run
@@ -411,6 +458,10 @@ def test_canonical_first_run_and_delta_report_dataset_style(db_path: Path, csv_d
     assert md_path.exists()
     assert png_path.exists()
     assert "delta" in md_text
+    assert "## Judge-Aligned Heatmap" in md_text
+    assert "| zone | cells |" in md_text
+    assert "Worst conversation x rule cells" in md_text
+    assert zones.issuperset({"green", "red"})
 
 
 def test_live_required_for_scan_dataset_style(db_path: Path, csv_dir: Path) -> None:

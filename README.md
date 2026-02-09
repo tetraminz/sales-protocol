@@ -11,6 +11,7 @@ Evaluator и `llm as judge` запускаются последовательн�
 Правило `empathy` определяется LLM строго по контексту чата, без keyword/threshold/gating в коде.
 Policy ошибок: schema-level ошибки (invalid_json_schema / validation schema mismatch) останавливают run.
 Если `evidence.quote/message_id` невалиден после второй попытки evaluator, кейс пропускается, run продолжается.
+`artifacts/accuracy_diff.png` формируется как judge-aligned heatmap `conversation x rule` с зонами качества.
 
 ## Один основной запуск
 ```bash

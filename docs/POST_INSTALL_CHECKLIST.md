@@ -1,6 +1,6 @@
 # Post-Install Checklist (Top Python Tooling)
 
-Use this after installing dependencies (`openai`, `pydantic`, `typer`, `pandas`, `matplotlib`, `pytest`, `jupyter`, `ipykernel`).
+Use this after installing dependencies (`openai`, `pydantic`, `pytest`, `jupyter`, `ipykernel`).
 
 ## 1) Environment
 ```bash
@@ -21,21 +21,21 @@ Expected minimum:
 - `messages=989`
 - `rules>=3`
 
-## 3) Eval + DIF artifacts
+## 3) Scan + report artifacts
 ```bash
-PYTHONPATH=src python3 -m dialogs.main run eval --mode baseline --db dialogs.db --rule-set default
-PYTHONPATH=src python3 -m dialogs.main run eval --mode sgr --db dialogs.db --rule-set default
-PYTHONPATH=src python3 -m dialogs.main run diff --run-a <BASELINE_RUN_ID> --run-b <SGR_RUN_ID> --db dialogs.db --png artifacts/accuracy_diff.png --md artifacts/metrics.md
+PYTHONPATH=src python3 -m dialogs.main run scan --db dialogs.db --model gpt-4.1-mini --conversation-from 0 --conversation-to 4
+PYTHONPATH=src python3 -m dialogs.main run report --db dialogs.db --png artifacts/accuracy_diff.png --md artifacts/metrics.md
 ```
 
 Validate files:
 - `artifacts/accuracy_diff.png` exists
-- `artifacts/metrics.md` contains run metadata and per-rule delta table
+- `artifacts/accuracy_diff.png` is a heatmap table `conversation x rule` with green/yellow/red zones
+- `artifacts/metrics.md` contains run metadata, per-rule delta table, zone summary, and worst cells
 
 ## 4) Full LLM debug
 ```bash
-PYTHONPATH=src python3 -m dialogs.main llm logs --run-id <LLM_RUN_ID> --db dialogs.db
-PYTHONPATH=src python3 -m dialogs.main llm logs --run-id <LLM_RUN_ID> --db dialogs.db --failed-only
+PYTHONPATH=src python3 -m dialogs.main llm logs --run-id <SCAN_RUN_ID> --db dialogs.db
+PYTHONPATH=src python3 -m dialogs.main llm logs --run-id <SCAN_RUN_ID> --db dialogs.db --failed-only
 ```
 
 Check:
@@ -53,16 +53,14 @@ Open and run top-to-bottom:
 
 Check notebook cells:
 - DB stats
-- baseline/sgr runs visibility
+- scan run visibility
 - LLM call samples
-- visual diff rendering from `artifacts/accuracy_diff.png`
+- visual heatmap rendering from `artifacts/accuracy_diff.png`
 
 ## 7) Optional live OpenAI validation
-Set key and repeat eval:
+Set key and repeat scan:
 ```bash
 export OPENAI_API_KEY=...
-PYTHONPATH=src python3 -m dialogs.main run eval --mode baseline --db dialogs.db --rule-set default
-PYTHONPATH=src python3 -m dialogs.main run eval --mode sgr --db dialogs.db --rule-set default
+PYTHONPATH=src python3 -m dialogs.main run scan --db dialogs.db --model gpt-4.1-mini --conversation-from 0 --conversation-to 4
+PYTHONPATH=src python3 -m dialogs.main run report --db dialogs.db --png artifacts/accuracy_diff.png --md artifacts/metrics.md
 ```
-
-Then compare live runs with fallback runs via `run diff`.

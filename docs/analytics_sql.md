@@ -22,7 +22,7 @@ LIMIT 1;
 WITH last_run AS (
   SELECT run_id
   FROM scan_runs
-  WHERE status = 'success'
+  WHERE status='success'
   ORDER BY started_at_utc DESC
   LIMIT 1
 )
@@ -139,10 +139,34 @@ ORDER BY ABS(r.eval_confidence - COALESCE(r.judge_confidence, 0)) DESC,
 LIMIT 50;
 ```
 
-<<<<<<< ours
-## 6) Как интерпретировать
-=======
-## 6) Проверка seller-only покрытия
+## 6) Heatmap-срез conversation x rule (judge-aligned)
+```sql
+WITH last_run AS (
+  SELECT run_id
+  FROM scan_runs
+  WHERE status='success'
+  ORDER BY started_at_utc DESC
+  LIMIT 1
+)
+SELECT
+  r.conversation_id,
+  r.rule_key,
+  SUM(CASE WHEN r.judge_label IS NOT NULL THEN 1 ELSE 0 END) AS judged_total,
+  SUM(CASE WHEN r.judge_label IS NOT NULL AND r.eval_hit = r.judge_label THEN 1 ELSE 0 END) AS agree_total,
+  SUM(CASE WHEN r.judge_label IS NOT NULL AND r.eval_hit <> r.judge_label THEN 1 ELSE 0 END) AS disagree_total,
+  CASE
+    WHEN SUM(CASE WHEN r.judge_label IS NOT NULL THEN 1 ELSE 0 END) = 0 THEN NULL
+    ELSE
+      1.0 * SUM(CASE WHEN r.judge_label IS NOT NULL AND r.eval_hit = r.judge_label THEN 1 ELSE 0 END)
+      / SUM(CASE WHEN r.judge_label IS NOT NULL THEN 1 ELSE 0 END)
+  END AS agreement_rate
+FROM scan_results r
+WHERE r.run_id=(SELECT run_id FROM last_run)
+GROUP BY r.conversation_id, r.rule_key
+ORDER BY r.conversation_id, r.rule_key;
+```
+
+## 7) Проверка seller-only покрытия
 ```sql
 WITH last_run AS (
   SELECT run_id
@@ -159,7 +183,7 @@ JOIN messages m ON m.message_id = r.message_id
 WHERE r.run_id=(SELECT run_id FROM last_run);
 ```
 
-## 7) Проверка контекстности empathy (без локального gating)
+## 8) Проверка контекстности empathy (без локального gating)
 ```sql
 WITH last_run AS (
   SELECT run_id
@@ -177,13 +201,9 @@ WHERE run_id=(SELECT run_id FROM last_run)
   AND rule_key='empathy';
 ```
 
-## 8) Как интерпретировать
->>>>>>> theirs
+## 9) Как интерпретировать
 - `coverage` растет: evaluator чаще срабатывает (`eval_hit=1`) на judged-кейсах.
 - `precision` падает: становится больше ложных срабатываний (`fp`).
 - `recall` растет: меньше пропусков (`fn`).
 - `delta` (current - canonical): `>0` улучшение, `<0` регресс относительно канона.
-<<<<<<< ours
-=======
-- Для `empathy` теперь всегда учитывайте, что оценка делается через chat context, а не по isolated message.
->>>>>>> theirs
+- Для `empathy` всегда учитывайте, что оценка делается через chat context, а не по isolated message.

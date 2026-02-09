@@ -441,6 +441,107 @@ def _accuracy_map(conn: sqlite3.Connection, *, run_id: str) -> dict[str, float]:
     return {row["rule_key"]: float(row["metric_value"]) for row in rows}
 
 
+def _build_accuracy_heatmap_data(
+    conn: sqlite3.Connection, *, run_id: str, rule_keys: list[str]
+) -> dict[str, list[Any]]:
+    conversation_ids = [
+        str(row["conversation_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT conversation_id FROM scan_results WHERE run_id=? ORDER BY conversation_id",
+            (run_id,),
+        ).fetchall()
+    ]
+    rows = conn.execute(
+        """
+        SELECT
+          conversation_id,
+          rule_key,
+          SUM(CASE WHEN judge_label IS NOT NULL THEN 1 ELSE 0 END) AS judged_total,
+          SUM(CASE WHEN judge_label IS NOT NULL AND eval_hit=judge_label THEN 1 ELSE 0 END) AS agree_total
+        FROM scan_results
+        WHERE run_id=?
+        GROUP BY conversation_id, rule_key
+        """,
+        (run_id,),
+    ).fetchall()
+
+    by_cell: dict[tuple[str, str], tuple[int, int]] = {
+        (str(row["conversation_id"]), str(row["rule_key"])): (
+            int(row["judged_total"] or 0),
+            int(row["agree_total"] or 0),
+        )
+        for row in rows
+    }
+
+    scores: list[list[float | None]] = []
+    judged_totals: list[list[int]] = []
+    for conversation_id in conversation_ids:
+        row_scores: list[float | None] = []
+        row_judged: list[int] = []
+        for rule_key in rule_keys:
+            judged, agree = by_cell.get((conversation_id, rule_key), (0, 0))
+            row_judged.append(judged)
+            row_scores.append(_safe_div(float(agree), float(judged)) if judged else None)
+        scores.append(row_scores)
+        judged_totals.append(row_judged)
+
+    return {
+        "conversation_ids": conversation_ids,
+        "rule_keys": list(rule_keys),
+        "scores": scores,
+        "judged_totals": judged_totals,
+    }
+
+
+def _heatmap_zone(score: float | None) -> str:
+    if score is None:
+        return "na"
+    if score >= 0.90:
+        return "green"
+    if score >= 0.70:
+        return "yellow"
+    return "red"
+
+
+def _summarize_heatmap_zones(scores: list[list[float | None]]) -> dict[str, int]:
+    counts = {"green": 0, "yellow": 0, "red": 0, "na": 0}
+    for row in scores:
+        for score in row:
+            counts[_heatmap_zone(score)] += 1
+    return counts
+
+
+def _worst_heatmap_cells(
+    *,
+    conversation_ids: list[str],
+    rule_keys: list[str],
+    scores: list[list[float | None]],
+    judged_totals: list[list[int]],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    ranked: list[tuple[float, int, str, str, int]] = []
+    for row_idx, conversation_id in enumerate(conversation_ids):
+        for col_idx, rule_key in enumerate(rule_keys):
+            judged = int(judged_totals[row_idx][col_idx])
+            score = scores[row_idx][col_idx]
+            if judged <= 0 or score is None:
+                continue
+            ranked.append((float(score), -judged, conversation_id, rule_key, judged))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    out: list[dict[str, Any]] = []
+    for score, _neg_judged, conversation_id, rule_key, judged in ranked[: max(0, int(limit))]:
+        out.append(
+            {
+                "conversation_id": conversation_id,
+                "rule_key": rule_key,
+                "score": float(score),
+                "judged_total": int(judged),
+            }
+        )
+    return out
+
+
 def build_report(
     conn: sqlite3.Connection,
     *,
@@ -467,6 +568,19 @@ def build_report(
     vals_can = [canonical.get(key, 0.0) for key in rule_keys]
     vals_cur = [current.get(key, 0.0) for key in rule_keys]
     deltas = [cur - can for can, cur in zip(vals_can, vals_cur)]
+    heatmap = _build_accuracy_heatmap_data(conn, run_id=run_id, rule_keys=rule_keys)
+    conversation_ids = [str(x) for x in heatmap["conversation_ids"]]
+    scores = heatmap["scores"]
+    judged_totals = heatmap["judged_totals"]
+    zone_counts = _summarize_heatmap_zones(scores)
+    worst_cells = _worst_heatmap_cells(
+        conversation_ids=conversation_ids,
+        rule_keys=rule_keys,
+        scores=scores,
+        judged_totals=judged_totals,
+    )
+    total_cells = len(conversation_ids) * len(rule_keys)
+    judged_cells = sum(1 for row in judged_totals for judged in row if int(judged) > 0)
 
     ensure_parent(md_path)
     lines = [
@@ -483,9 +597,40 @@ def build_report(
         sign = "+" if delta > 0 else ""
         lines.append(f"| `{key}` | {vals_can[idx]:.4f} | {vals_cur[idx]:.4f} | {sign}{delta:.4f} |")
 
+    lines.extend(
+        [
+            "",
+            "## Judge-Aligned Heatmap",
+            "",
+            "- thresholds: `green >= 0.90`, `yellow >= 0.70`, `red < 0.70`, `na = no_judged`",
+            f"- conversations: `{len(conversation_ids)}`",
+            f"- rules: `{len(rule_keys)}`",
+            f"- judged_cells: `{judged_cells}/{total_cells}`",
+            "",
+            "| zone | cells |",
+            "|---|---:|",
+            f"| `green` | {zone_counts['green']} |",
+            f"| `yellow` | {zone_counts['yellow']} |",
+            f"| `red` | {zone_counts['red']} |",
+            f"| `na` | {zone_counts['na']} |",
+            "",
+            "### Worst conversation x rule cells",
+            "",
+            "| conversation_id | rule | score | judged_total |",
+            "|---|---|---:|---:|",
+        ]
+    )
+    if worst_cells:
+        for cell in worst_cells:
+            lines.append(
+                f"| `{cell['conversation_id']}` | `{cell['rule_key']}` | {float(cell['score']):.4f} | {int(cell['judged_total'])} |"
+            )
+    else:
+        lines.append("| `-` | `-` | n/a | 0 |")
+
     Path(md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     ensure_parent(png_path)
-    _write_accuracy_diff_png(png_path, rule_keys, vals_can, vals_cur)
+    _write_accuracy_diff_png(png_path, rule_keys, conversation_ids, scores)
 
     return {
         "run_id": run_id,
@@ -493,39 +638,233 @@ def build_report(
         "rules": len(rule_keys),
         "md_path": md_path,
         "png_path": png_path,
+}
+
+
+_FONT_5X7: dict[str, tuple[str, ...]] = {
+    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+    "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+    "_": ("00000", "00000", "00000", "00000", "00000", "00000", "11111"),
+    ".": ("00000", "00000", "00000", "00000", "00000", "01100", "01100"),
+    "/": ("00001", "00010", "00100", "01000", "10000", "00000", "00000"),
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "10000", "10000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
+    "D": ("11100", "10010", "10001", "10001", "10001", "10010", "11100"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01110"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
+    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01110", "10001", "10000", "01110", "00001", "10001", "01110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "?": ("01110", "10001", "00001", "00010", "00100", "00000", "00100"),
+}
+
+
+def _new_rgb_image(width: int, height: int, rgb: tuple[int, int, int]) -> list[list[list[int]]]:
+    return [[[rgb[0], rgb[1], rgb[2]] for _ in range(width)] for _ in range(height)]
+
+
+def _fill_rect(
+    img: list[list[list[int]]],
+    *,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    color: tuple[int, int, int],
+) -> None:
+    height = len(img)
+    width = len(img[0]) if height else 0
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(width, x + max(0, w))
+    y1 = min(height, y + max(0, h))
+    for yy in range(y0, y1):
+        for xx in range(x0, x1):
+            img[yy][xx] = [color[0], color[1], color[2]]
+
+
+def _stroke_rect(
+    img: list[list[list[int]]],
+    *,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    color: tuple[int, int, int],
+) -> None:
+    if w <= 0 or h <= 0:
+        return
+    _fill_rect(img, x=x, y=y, w=w, h=1, color=color)
+    _fill_rect(img, x=x, y=y + h - 1, w=w, h=1, color=color)
+    _fill_rect(img, x=x, y=y, w=1, h=h, color=color)
+    _fill_rect(img, x=x + w - 1, y=y, w=1, h=h, color=color)
+
+
+def _char_bitmap(ch: str) -> tuple[str, ...]:
+    return _FONT_5X7.get(ch, _FONT_5X7["?"])
+
+
+def _measure_text(text: str, *, scale: int = 1, letter_gap: int = 1) -> int:
+    if not text:
+        return 0
+    chars = [ch if ch in _FONT_5X7 else "?" for ch in text.upper()]
+    char_w = 5 * scale
+    return len(chars) * char_w + max(0, len(chars) - 1) * letter_gap
+
+
+def _draw_text(
+    img: list[list[list[int]]],
+    *,
+    x: int,
+    y: int,
+    text: str,
+    color: tuple[int, int, int],
+    scale: int = 1,
+    letter_gap: int = 1,
+) -> None:
+    xx = x
+    for raw in text.upper():
+        ch = raw if raw in _FONT_5X7 else "?"
+        bitmap = _char_bitmap(ch)
+        for row_idx, row_bits in enumerate(bitmap):
+            for col_idx, bit in enumerate(row_bits):
+                if bit == "1":
+                    _fill_rect(
+                        img,
+                        x=xx + col_idx * scale,
+                        y=y + row_idx * scale,
+                        w=scale,
+                        h=scale,
+                        color=color,
+                    )
+        xx += 5 * scale + letter_gap
+
+
+def _write_accuracy_diff_png(
+    path: str,
+    rule_keys: list[str],
+    conversation_ids: list[str],
+    scores: list[list[float | None]],
+) -> None:
+    text_color = (22, 22, 22)
+    grid_border = (220, 220, 220)
+    zone_color = {
+        "green": (66, 161, 96),
+        "yellow": (227, 182, 67),
+        "red": (201, 82, 70),
+        "na": (186, 186, 186),
     }
 
+    title_scale = 2
+    label_scale = 1
+    cell_w = 56
+    cell_h = 18
+    cell_gap = 2
+    left_pad = 16
+    right_pad = 16
+    top_pad = 14
+    bottom_pad = 16
+    label_gap = 12
+    legend_gap = 12
+    legend_chip = 10
+    header_label = "CONVERSATION"
 
-def _write_accuracy_diff_png(path: str, rule_keys: list[str], baseline: list[float], current: list[float]) -> None:
-    count = max(1, len(rule_keys))
-    bar_w = 20
-    gap = 12
-    group_w = bar_w * 2 + gap
-    margin = 24
-    width = margin * 2 + group_w * count
-    height = 260
-    baseline_y = height - 24
-    max_h = 190
+    rendered_rows = conversation_ids if conversation_ids else ["NO_DATA"]
+    rendered_scores = scores if scores else [[None for _ in rule_keys]]
+    longest_row_w = max((_measure_text(row, scale=label_scale) for row in rendered_rows), default=0)
+    row_label_w = max(longest_row_w, _measure_text(header_label, scale=label_scale))
 
-    img = [[[255, 255, 255] for _ in range(width)] for _ in range(height)]
-    for x in range(margin - 4, width - margin + 4):
-        img[baseline_y][x] = [40, 40, 40]
+    title = "EVAL VS JUDGE HEATMAP"
+    title_h = 7 * title_scale
+    title_w = _measure_text(title, scale=title_scale)
 
-    for i in range(count):
-        x0 = margin + i * group_w
-        h_a = int(max_h * max(0.0, min(1.0, baseline[i])))
-        h_b = int(max_h * max(0.0, min(1.0, current[i])))
+    legend_items = [
+        ("GREEN 0.90-1.00", zone_color["green"]),
+        ("YELLOW 0.70-0.89", zone_color["yellow"]),
+        ("RED 0.00-0.69", zone_color["red"]),
+        ("NA NO_JUDGED", zone_color["na"]),
+    ]
+    legend_item_widths = [legend_chip + 5 + _measure_text(label, scale=label_scale) for label, _ in legend_items]
+    legend_total_w = sum(legend_item_widths) + legend_gap * max(0, len(legend_items) - 1)
+    legend_h = max(legend_chip, 7 * label_scale)
 
-        for x in range(x0, x0 + bar_w):
-            for y in range(baseline_y - h_a, baseline_y):
-                if 0 <= y < height:
-                    img[y][x] = [120, 120, 120]
+    cols = max(1, len(rule_keys))
+    grid_w = cols * cell_w + max(0, cols - 1) * cell_gap
+    col_label_h = 7 * label_scale
+    rows = len(rendered_rows)
+    grid_h = rows * cell_h + max(0, rows - 1) * cell_gap
 
-        xb = x0 + bar_w + 4
-        for x in range(xb, xb + bar_w):
-            for y in range(baseline_y - h_b, baseline_y):
-                if 0 <= y < height:
-                    img[y][x] = [52, 168, 83]
+    grid_left = left_pad + row_label_w + label_gap
+    col_labels_y = top_pad + title_h + 10 + legend_h + 10
+    grid_top = col_labels_y + col_label_h + 8
+
+    width = max(
+        grid_left + grid_w + right_pad,
+        left_pad + max(title_w, legend_total_w) + right_pad,
+    )
+    height = grid_top + grid_h + bottom_pad
+
+    img = _new_rgb_image(width, height, (255, 255, 255))
+    _draw_text(img, x=left_pad, y=top_pad, text=title, color=text_color, scale=title_scale)
+
+    legend_x = left_pad
+    legend_y = top_pad + title_h + 10
+    for label, color in legend_items:
+        _fill_rect(img, x=legend_x, y=legend_y + 1, w=legend_chip, h=legend_chip, color=color)
+        _stroke_rect(img, x=legend_x, y=legend_y + 1, w=legend_chip, h=legend_chip, color=grid_border)
+        _draw_text(
+            img,
+            x=legend_x + legend_chip + 5,
+            y=legend_y + 2,
+            text=label,
+            color=text_color,
+            scale=label_scale,
+        )
+        legend_x += legend_chip + 5 + _measure_text(label, scale=label_scale) + legend_gap
+
+    _draw_text(img, x=left_pad, y=col_labels_y, text=header_label, color=text_color, scale=label_scale)
+    for idx, rule_key in enumerate(rule_keys):
+        x = grid_left + idx * (cell_w + cell_gap) + 2
+        _draw_text(img, x=x, y=col_labels_y, text=rule_key, color=text_color, scale=label_scale)
+
+    for row_idx, conversation_id in enumerate(rendered_rows):
+        y = grid_top + row_idx * (cell_h + cell_gap)
+        label_y = y + max(0, (cell_h - 7 * label_scale) // 2)
+        _draw_text(img, x=left_pad, y=label_y, text=conversation_id, color=text_color, scale=label_scale)
+        for col_idx in range(cols):
+            x = grid_left + col_idx * (cell_w + cell_gap)
+            score = rendered_scores[row_idx][col_idx] if col_idx < len(rendered_scores[row_idx]) else None
+            fill = zone_color[_heatmap_zone(score)]
+            _fill_rect(img, x=x, y=y, w=cell_w, h=cell_h, color=fill)
+            _stroke_rect(img, x=x, y=y, w=cell_w, h=cell_h, color=grid_border)
 
     _write_png_rgb(path, img)
 
