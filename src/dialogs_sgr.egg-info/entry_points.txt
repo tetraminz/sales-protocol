@@ -1,0 +1,2 @@
+[console_scripts]
+dialogs = dialogs.cli:main

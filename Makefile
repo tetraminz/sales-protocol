@@ -1,37 +1,33 @@
-DB ?= out/annotations.db
-INPUT_DIR ?= sales-transcripts/data/chunked_transcripts
-FROM ?= 1
-TO ?= 20
+DB ?= dialogs.db
+CSV_DIR ?= csv
+PROMPT_VERSION ?= v1
+SGR_VERSION ?= v1
 MODEL ?= gpt-4.1-mini
+PY ?= PYTHONPATH=src python3
 
-.PHONY: help setup annotate analytics debug-release report release-check test
+.PHONY: init ingest stats baseline sgr diff demo test
 
-help:
-	@echo "Targets:"
-	@echo "  make setup DB=out/annotations.db"
-	@echo "  OPENAI_API_KEY=... make annotate DB=out/annotations.db INPUT_DIR=sales-transcripts/data/chunked_transcripts FROM=1 TO=20 MODEL=gpt-4.1-mini"
-	@echo "  make analytics DB=out/annotations.db"
-	@echo "  make debug-release DB=out/annotations.db"
-	@echo "  make report DB=out/annotations.db"
-	@echo "  make release-check"
-	@echo "  make test"
+init:
+	$(PY) -m dialogs.main db init --db "$(DB)"
 
-setup:
-	go run . setup --db "$(DB)"
+ingest:
+	$(PY) -m dialogs.main data ingest-csv --csv-dir "$(CSV_DIR)" --db "$(DB)" --replace
 
-annotate:
-	go run . annotate --db "$(DB)" --input_dir "$(INPUT_DIR)" --from_idx "$(FROM)" --to_idx "$(TO)" --model "$(MODEL)"
+stats:
+	$(PY) -m dialogs.main db stats --db "$(DB)"
 
-analytics:
-	go run . analytics --db "$(DB)" --out "out/analytics_latest.md"
+baseline:
+	$(PY) -m dialogs.main run eval --mode baseline --db "$(DB)" --rule-set default --prompt-version "$(PROMPT_VERSION)" --sgr-version "$(SGR_VERSION)" --model "$(MODEL)"
 
-debug-release:
-	go run . debug-release --db "$(DB)" --out "out/release_debug_latest.md"
+sgr:
+	$(PY) -m dialogs.main run eval --mode sgr --db "$(DB)" --rule-set default --prompt-version "$(PROMPT_VERSION)" --sgr-version "$(SGR_VERSION)" --model "$(MODEL)"
 
-report:
-	go run . report --db "$(DB)"
+diff:
+	@echo "Usage: make diff RUN_A=<exp_id> RUN_B=<exp_id>"
+	$(PY) -m dialogs.main run diff --run-a "$(RUN_A)" --run-b "$(RUN_B)" --db "$(DB)" --png artifacts/accuracy_diff.png --md artifacts/metrics.md
 
-release-check: annotate analytics debug-release report
+demo:
+	$(PY) -m dialogs.demo
 
 test:
-	go test ./...
+	PYTHONPATH=src pytest -q
