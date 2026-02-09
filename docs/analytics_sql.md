@@ -139,8 +139,51 @@ ORDER BY ABS(r.eval_confidence - COALESCE(r.judge_confidence, 0)) DESC,
 LIMIT 50;
 ```
 
+<<<<<<< ours
 ## 6) Как интерпретировать
+=======
+## 6) Проверка seller-only покрытия
+```sql
+WITH last_run AS (
+  SELECT run_id
+  FROM scan_runs
+  ORDER BY started_at_utc DESC
+  LIMIT 1
+)
+SELECT
+  COUNT(*) AS total_results,
+  SUM(CASE WHEN m.speaker_label='Sales Rep' THEN 1 ELSE 0 END) AS seller_results,
+  SUM(CASE WHEN m.speaker_label<>'Sales Rep' THEN 1 ELSE 0 END) AS non_seller_results
+FROM scan_results r
+JOIN messages m ON m.message_id = r.message_id
+WHERE r.run_id=(SELECT run_id FROM last_run);
+```
+
+## 7) Проверка контекстности empathy (без локального gating)
+```sql
+WITH last_run AS (
+  SELECT run_id
+  FROM scan_runs
+  ORDER BY started_at_utc DESC
+  LIMIT 1
+)
+SELECT
+  COUNT(*) AS empathy_evaluator_calls,
+  SUM(CASE WHEN request_json LIKE '%Контекст чата%' THEN 1 ELSE 0 END) AS with_chat_context,
+  SUM(CASE WHEN request_json LIKE '%Customer:%' THEN 1 ELSE 0 END) AS with_customer_context
+FROM llm_calls
+WHERE run_id=(SELECT run_id FROM last_run)
+  AND phase='evaluator'
+  AND rule_key='empathy';
+```
+
+## 8) Как интерпретировать
+>>>>>>> theirs
 - `coverage` растет: evaluator чаще срабатывает (`eval_hit=1`) на judged-кейсах.
 - `precision` падает: становится больше ложных срабатываний (`fp`).
 - `recall` растет: меньше пропусков (`fn`).
 - `delta` (current - canonical): `>0` улучшение, `<0` регресс относительно канона.
+<<<<<<< ours
+=======
+- Для `empathy` теперь всегда учитывайте, что оценка делается через chat context, а не по isolated message.
+>>>>>>> theirs

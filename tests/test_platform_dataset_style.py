@@ -20,7 +20,10 @@ class FakeLLM:
         self.model = "fake-model"
         self.mode = mode
         self.calls = 0
-        self._judge_error_done = False
+        self._mismatch_once_used = False
+        self.greeting_eval_attempts: list[int] = []
+        self.empathy_eval_prompts: list[str] = []
+        self.empathy_judge_prompts: list[str] = []
 
     def require_live(self, purpose: str) -> None:  # noqa: ARG002
         return None
@@ -28,10 +31,19 @@ class FakeLLM:
     def call_json_schema(self, conn, **kwargs):  # noqa: ANN001
         self.calls += 1
         phase = kwargs["phase"]
+        attempt = int(kwargs.get("attempt", 1))
         model_type = kwargs["model_type"]
         run_id = kwargs["run_id"]
         rule_key = kwargs["rule_key"]
         message_id = int(kwargs["message_id"])
+        user_prompt = str(kwargs["user_prompt"])
+
+        if phase == "evaluator" and rule_key == "empathy":
+            self.empathy_eval_prompts.append(user_prompt)
+        if phase == "judge" and rule_key == "empathy":
+            self.empathy_judge_prompts.append(user_prompt)
+        if phase == "evaluator" and rule_key == "greeting":
+            self.greeting_eval_attempts.append(attempt)
 
         if self.mode == "schema_once" and self.calls == 1:
             return CallResult(
@@ -53,36 +65,43 @@ class FakeLLM:
                 is_live_error=True,
             )
 
-        if self.mode == "judge_non_schema_once" and phase == "judge" and not self._judge_error_done:
-            self._judge_error_done = True
-            return CallResult(
-                parsed=None,
-                parse_ok=False,
-                validation_ok=False,
-                error_message="live_call_failed: Error code: 502 - bad gateway",
-                is_schema_error=False,
-                is_live_error=True,
-            )
-
         if model_type is EvaluatorResult:
             text = str(
                 conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]
-            )
-            text_l = text.lower()
+            ).lower()
+
+            if self.mode == "evidence_mismatch_once" and rule_key == "greeting" and attempt == 1 and not self._mismatch_once_used:
+                self._mismatch_once_used = True
+                quote = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]).split()[0]
+                parsed = EvaluatorResult(
+                    hit=True,
+                    confidence=0.8,
+                    evidence=Evidence(quote=quote, message_id=message_id + 3),
+                    reason="mismatch-once",
+                )
+                return CallResult(parsed, True, True, "", False, False)
+
+            if self.mode == "evidence_mismatch_always" and rule_key == "greeting":
+                quote = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]).split()[0]
+                parsed = EvaluatorResult(
+                    hit=True,
+                    confidence=0.8,
+                    evidence=Evidence(quote=quote, message_id=message_id + 3),
+                    reason="mismatch-always",
+                )
+                return CallResult(parsed, True, True, "", False, False)
+
             if rule_key == "greeting":
-                hit = "здрав" in text_l or "привет" in text_l
+                hit = "здрав" in text or "привет" in text
             elif rule_key == "upsell":
-                hit = "пакет" in text_l or "тариф" in text_l or "доп" in text_l
+                hit = "пакет" in text or "тариф" in text or "доп" in text
             elif rule_key == "empathy":
-                hit = "понима" in text_l or "сожале" in text_l
+                # В тесте важно, что контекст реально передан и участвует в решении.
+                hit = ("понима" in text or "сожале" in text) and ("customer:" in user_prompt.lower())
             else:
                 hit = False
 
-            if hit:
-                quote = text.split()[0]
-            else:
-                quote = ""
-
+            quote = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]).split()[0] if hit else ""
             parsed = EvaluatorResult(
                 hit=hit,
                 confidence=0.8,
@@ -116,21 +135,15 @@ def csv_dir(tmp_path: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
 
     header = ["Conversation", "Chunk_id", "Speaker", "Text", "Embedding"]
-    texts = [
-        "Здравствуйте! Понимаю ваш запрос, могу предложить пакет Plus.",
-        "Здравствуйте, чем могу помочь?",
-        "Могу предложить расширенный тариф Plus.",
-        "Понимаю вашу ситуацию и постараюсь помочь.",
-        "Спасибо за обращение.",
-        "Здравствуйте, могу предложить пакет и понимаю ваш бюджет.",
-    ]
-
-    for idx, text in enumerate(texts):
+    for idx in range(6):
         path = directory / f"conv_{idx:02d}.csv"
         with path.open("w", encoding="utf-8", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(header)
-            writer.writerow([f"conv_{idx:02d}", 1, "Sales Rep", text, "[]"])
+            writer.writerow([f"conv_{idx:02d}", 1, "Customer", "Здравствуйте, у меня сложная ситуация", "[]"])
+            writer.writerow([f"conv_{idx:02d}", 2, "Sales Rep", "Здравствуйте! Понимаю вашу ситуацию и помогу", "[]"])
+            writer.writerow([f"conv_{idx:02d}", 3, "Customer", "Бюджет ограничен", "[]"])
+            writer.writerow([f"conv_{idx:02d}", 4, "Sales Rep", "Могу предложить пакет Plus как доп. вариант", "[]"])
 
     return directory
 
@@ -212,9 +225,10 @@ def test_evidence_referential_integrity_dataset_style(case: dict[str, object]) -
 
 def test_scan_default_range_first_five_dataset_style(db_path: Path, csv_dir: Path) -> None:
     init_db(str(db_path))
+    fake = FakeLLM("ok")
     with connect(str(db_path)) as conn:
         ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=FakeLLM("ok"))
+        run_id = run_scan(conn, llm=fake)
         summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
         convs = conn.execute(
             "SELECT DISTINCT conversation_id FROM scan_results WHERE run_id=? ORDER BY conversation_id",
@@ -224,7 +238,56 @@ def test_scan_default_range_first_five_dataset_style(db_path: Path, csv_dir: Pat
     assert summary["selected_conversations"] == 5
     assert summary["conversation_from"] == 0
     assert summary["conversation_to"] == 4
+    assert summary["seller_messages"] == 10
     assert [row[0] for row in convs] == ["conv_00", "conv_01", "conv_02", "conv_03", "conv_04"]
+
+
+def test_seller_only_results_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=1)
+        non_seller_rows = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM scan_results r
+                JOIN messages m ON m.message_id = r.message_id
+                WHERE r.run_id=? AND m.speaker_label <> 'Sales Rep'
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        )
+
+    assert non_seller_rows == 0
+
+
+def test_context_is_passed_for_empathy_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    fake = FakeLLM("ok")
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_scan(conn, llm=fake, conversation_from=0, conversation_to=0)
+
+    assert fake.empathy_eval_prompts
+    assert fake.empathy_judge_prompts
+    assert all("Контекст чата" in p for p in fake.empathy_eval_prompts)
+    assert all("Customer:" in p for p in fake.empathy_eval_prompts)
+    assert all("Customer:" in p for p in fake.empathy_judge_prompts)
+
+
+def test_no_heuristic_gating_for_empathy_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    fake = FakeLLM("ok")
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_id = run_scan(conn, llm=fake, conversation_from=0, conversation_to=1)
+        summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
+        results_count = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
+
+    assert summary["seller_messages"] == 4
+    assert len(fake.empathy_eval_prompts) == 4
+    assert results_count == 12
 
 
 def test_scan_explicit_range_inclusive_dataset_style(db_path: Path, csv_dir: Path) -> None:
@@ -262,6 +325,40 @@ def test_scan_schema_error_fails_fast_dataset_style(db_path: Path, csv_dir: Path
         row = conn.execute("SELECT status FROM scan_runs ORDER BY started_at_utc DESC LIMIT 1").fetchone()
 
     assert row["status"] == "failed"
+
+
+def test_evaluator_evidence_mismatch_retried_once_then_success_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    fake = FakeLLM("evidence_mismatch_once")
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_id = run_scan(conn, llm=fake, conversation_from=0, conversation_to=0)
+        status = conn.execute("SELECT status FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0]
+        rows = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
+
+    assert status == "success"
+    assert rows == 6
+    assert 2 in fake.greeting_eval_attempts
+
+
+def test_evaluator_evidence_mismatch_twice_should_skip_not_fail_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_id = run_scan(conn, llm=FakeLLM("evidence_mismatch_always"), conversation_from=0, conversation_to=0)
+        row = conn.execute("SELECT status, summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()
+        summary = json.loads(row["summary_json"])
+        greeting_rows = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM scan_results WHERE run_id=? AND rule_key='greeting'",
+                (run_id,),
+            ).fetchone()[0]
+        )
+
+    assert row["status"] == "success"
+    assert summary["skipped_due_to_errors"] >= 1
+    assert summary["evidence_mismatch_skipped"] >= 1
+    assert greeting_rows == 0
 
 
 def test_judge_phase_updates_existing_rows_and_no_duplicates_dataset_style(db_path: Path, csv_dir: Path) -> None:

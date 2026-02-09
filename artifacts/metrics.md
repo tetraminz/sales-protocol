@@ -1,10 +1,10 @@
 # SGR Scan Metrics
 
-- canonical_run_id: `scan_c0a2170b9114`
-- current_run_id: `scan_c0a2170b9114`
+- canonical_run_id: `scan_488bdc081429`
+- current_run_id: `scan_488bdc081429`
 
 | rule | canonical_accuracy | current_accuracy | delta |
 |---|---:|---:|---:|
-| `greeting` | 0.0625 | 0.0625 | 0.0000 |
-| `upsell` | 0.0521 | 0.0521 | 0.0000 |
-| `empathy` | 0.2083 | 0.2083 | 0.0000 |
+| `greeting` | 0.1224 | 0.1224 | 0.0000 |
+| `upsell` | 0.1875 | 0.1875 | 0.0000 |
+| `empathy` | 0.5306 | 0.5306 | 0.0000 |

@@ -12,7 +12,14 @@ from .db import get_state, set_state
 from .llm import LLMClient
 from .llm_as_judge import build_judge_prompts
 from .models import Evidence, EvaluatorResult, JudgeResult
-from .sgr_core import all_rules, build_evaluator_prompts, evidence_error
+from .sgr_core import (
+    all_rules,
+    build_chat_context,
+    build_evaluator_prompts,
+    build_evidence_correction_note,
+    evidence_error,
+    is_seller_message,
+)
 from .utils import ensure_parent, jdump, now_utc
 
 
@@ -167,8 +174,13 @@ def run_scan(
         conversation_from=conversation_from,
         conversation_to=conversation_to,
     )
+    by_conversation: dict[str, list[sqlite3.Row]] = {}
+    for message in messages:
+        by_conversation.setdefault(message["conversation_id"], []).append(message)
+
     rules = all_rules()
     run_id = f"scan_{uuid.uuid4().hex[:12]}"
+    seller_messages = sum(1 for m in messages if is_seller_message(str(m["speaker_label"])))
 
     _insert_run(
         conn,
@@ -185,6 +197,7 @@ def run_scan(
         "inserted": 0,
         "judged": 0,
         "skipped_due_to_errors": 0,
+        "evidence_mismatch_skipped": 0,
         "schema_errors": 0,
         "non_schema_errors": 0,
     }
@@ -193,80 +206,124 @@ def run_scan(
         "conversation_to": conversation_to,
         "selected_conversations": len(conversation_ids),
         "messages": len(messages),
+        "seller_messages": seller_messages,
+        "customer_messages_context_only": len(messages) - seller_messages,
         "rules": len(rules),
     }
 
     print(
-        f"[scan] conversations={len(conversation_ids)} messages={len(messages)} "
+        f"[scan] conversations={len(conversation_ids)} messages={len(messages)} seller_messages={seller_messages} "
         f"rules={len(rules)} range={conversation_from}..{conversation_to}"
     )
 
     status = "failed"
     conv_pos = {cid: i + 1 for i, cid in enumerate(conversation_ids)}
+    context_by_message_id: dict[int, str] = {}
     try:
-        current_conv = ""
-        for message in messages:
-            if message["conversation_id"] != current_conv:
-                current_conv = message["conversation_id"]
-                print(f"[scan] evaluator conversation {conv_pos[current_conv]}/{len(conversation_ids)} id={current_conv}")
+        for conversation_id in conversation_ids:
+            conversation_messages = by_conversation.get(conversation_id, [])
+            print(f"[scan] evaluator conversation {conv_pos[conversation_id]}/{len(conversation_ids)} id={conversation_id}")
 
-            for rule in rules:
-                counters["processed"] += 1
-                sys_prompt, user_prompt = build_evaluator_prompts(
-                    rule,
-                    speaker_label=message["speaker_label"],
-                    text=message["text"],
-                    message_id=int(message["message_id"]),
-                )
-                call = llm.call_json_schema(
-                    conn,
-                    run_id=run_id,
-                    phase="evaluator",
-                    rule_key=rule.key,
-                    conversation_id=message["conversation_id"],
-                    message_id=int(message["message_id"]),
-                    model_type=EvaluatorResult,
-                    system_prompt=sys_prompt,
-                    user_prompt=user_prompt,
-                )
-                if call.is_schema_error:
-                    counters["schema_errors"] += 1
-                    raise ValueError(f"schema_error {call.error_message}")
-                if call.error_message:
-                    _warn_non_schema(counters, phase="evaluator", rule_key=rule.key, error=call.error_message)
+            for message in conversation_messages:
+                if not is_seller_message(str(message["speaker_label"])):
                     continue
-                if not isinstance(call.parsed, EvaluatorResult):
-                    counters["schema_errors"] += 1
-                    raise ValueError("schema_error evaluator payload type mismatch")
 
-                err = evidence_error(call.parsed, message_id=int(message["message_id"]), text=message["text"])
-                if err:
-                    counters["schema_errors"] += 1
-                    raise ValueError(f"schema_error {err}")
-
-                conn.execute(
-                    """
-                    INSERT INTO scan_results(
-                      run_id, conversation_id, message_id, rule_key,
-                      eval_hit, eval_confidence, evidence_quote, evidence_message_id, eval_reason,
-                      judge_label, judge_confidence, judge_rationale, created_at_utc, updated_at_utc
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
-                    """,
-                    (
-                        run_id,
-                        message["conversation_id"],
-                        int(message["message_id"]),
-                        rule.key,
-                        1 if call.parsed.hit else 0,
-                        float(call.parsed.confidence),
-                        call.parsed.evidence.quote,
-                        int(call.parsed.evidence.message_id),
-                        call.parsed.reason,
-                        now_utc(),
-                        now_utc(),
-                    ),
+                message_id = int(message["message_id"])
+                chat_context = build_chat_context(
+                    conversation_messages,
+                    current_message_order=int(message["message_order"]),
                 )
-                counters["inserted"] += 1
+                context_by_message_id[message_id] = chat_context
+
+                for rule in rules:
+                    counters["processed"] += 1
+                    sys_prompt, user_prompt = build_evaluator_prompts(
+                        rule,
+                        speaker_label=message["speaker_label"],
+                        text=message["text"],
+                        message_id=message_id,
+                        chat_context=chat_context,
+                    )
+                    call = llm.call_json_schema(
+                        conn,
+                        run_id=run_id,
+                        phase="evaluator",
+                        rule_key=rule.key,
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        model_type=EvaluatorResult,
+                        system_prompt=sys_prompt,
+                        user_prompt=user_prompt,
+                        attempt=1,
+                    )
+                    if call.is_schema_error:
+                        counters["schema_errors"] += 1
+                        raise ValueError(f"schema_error {call.error_message}")
+                    if call.error_message:
+                        _warn_non_schema(counters, phase="evaluator", rule_key=rule.key, error=call.error_message)
+                        continue
+                    if not isinstance(call.parsed, EvaluatorResult):
+                        counters["schema_errors"] += 1
+                        raise ValueError("schema_error evaluator payload type mismatch")
+
+                    err = evidence_error(call.parsed, message_id=message_id, text=message["text"])
+                    if err:
+                        retry = llm.call_json_schema(
+                            conn,
+                            run_id=run_id,
+                            phase="evaluator",
+                            rule_key=rule.key,
+                            conversation_id=conversation_id,
+                            message_id=message_id,
+                            model_type=EvaluatorResult,
+                            system_prompt=sys_prompt,
+                            user_prompt=f"{user_prompt}\n\n{build_evidence_correction_note(message_id)}",
+                            attempt=2,
+                        )
+                        if retry.is_schema_error:
+                            counters["schema_errors"] += 1
+                            raise ValueError(f"schema_error {retry.error_message}")
+                        if retry.error_message:
+                            _warn_non_schema(counters, phase="evaluator", rule_key=rule.key, error=retry.error_message)
+                            continue
+                        if not isinstance(retry.parsed, EvaluatorResult):
+                            counters["schema_errors"] += 1
+                            raise ValueError("schema_error evaluator retry payload type mismatch")
+                        err = evidence_error(retry.parsed, message_id=message_id, text=message["text"])
+                        if err:
+                            counters["evidence_mismatch_skipped"] += 1
+                            _warn_non_schema(
+                                counters,
+                                phase="evaluator",
+                                rule_key=rule.key,
+                                error=f"evidence_integrity_failed_after_retry: {err}",
+                            )
+                            continue
+                        call = retry
+
+                    conn.execute(
+                        """
+                        INSERT INTO scan_results(
+                          run_id, conversation_id, message_id, rule_key,
+                          eval_hit, eval_confidence, evidence_quote, evidence_message_id, eval_reason,
+                          judge_label, judge_confidence, judge_rationale, created_at_utc, updated_at_utc
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            conversation_id,
+                            message_id,
+                            rule.key,
+                            1 if call.parsed.hit else 0,
+                            float(call.parsed.confidence),
+                            call.parsed.evidence.quote,
+                            int(call.parsed.evidence.message_id),
+                            call.parsed.reason,
+                            now_utc(),
+                            now_utc(),
+                        ),
+                    )
+                    counters["inserted"] += 1
         conn.commit()
 
         judge_rows = conn.execute(
@@ -290,6 +347,11 @@ def run_scan(
                 current_conv = row["conversation_id"]
                 print(f"[scan] judge conversation {conv_pos[current_conv]}/{len(conversation_ids)} id={current_conv}")
 
+            message_id = int(row["message_id"])
+            chat_context = context_by_message_id.get(
+                message_id,
+                f"[{row['speaker_label']}] {row['text']}",
+            )
             eval_result = EvaluatorResult(
                 hit=bool(row["eval_hit"]),
                 confidence=float(row["eval_confidence"]),
@@ -304,6 +366,7 @@ def run_scan(
                 rule,
                 speaker_label=row["speaker_label"],
                 text=row["text"],
+                chat_context=chat_context,
                 evaluator=eval_result,
             )
             call = llm.call_json_schema(
@@ -312,7 +375,7 @@ def run_scan(
                 phase="judge",
                 rule_key=row["rule_key"],
                 conversation_id=row["conversation_id"],
-                message_id=int(row["message_id"]),
+                message_id=message_id,
                 model_type=JudgeResult,
                 system_prompt=sys_prompt,
                 user_prompt=user_prompt,
@@ -357,7 +420,9 @@ def run_scan(
         print(
             "[scan] summary "
             f"processed={counters['processed']} inserted={counters['inserted']} judged={counters['judged']} "
-            f"skipped_due_to_errors={counters['skipped_due_to_errors']} schema_errors={counters['schema_errors']}"
+            f"skipped_due_to_errors={counters['skipped_due_to_errors']} "
+            f"evidence_mismatch_skipped={counters['evidence_mismatch_skipped']} "
+            f"schema_errors={counters['schema_errors']}"
         )
         return run_id
     except Exception as exc:

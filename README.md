@@ -6,6 +6,11 @@
 - `empathy`
 
 Evaluator и `llm as judge` запускаются последовательно в одном `run_id`.
+Таргет оценки: только `Sales Rep`.
+Реплики `Customer` не оцениваются напрямую и используются только как контекст чата.
+Правило `empathy` определяется LLM строго по контексту чата, без keyword/threshold/gating в коде.
+Policy ошибок: schema-level ошибки (invalid_json_schema / validation schema mismatch) останавливают run.
+Если `evidence.quote/message_id` невалиден после второй попытки evaluator, кейс пропускается, run продолжается.
 
 ## Один основной запуск
 ```bash
