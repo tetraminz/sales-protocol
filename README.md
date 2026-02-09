@@ -1,23 +1,29 @@
-# dialogs-sgr (Python-only)
+# dialogs-sgr
 
-Минимальная демо-платформа SGR для проверки бизнес-правил в диалогах.
+Минимальный SGR-сканер для 3 hardcoded правил:
+- `greeting`
+- `upsell`
+- `empathy`
 
-## Один способ запуска
+Evaluator и `llm as judge` запускаются последовательно в одном `run_id`.
+
+## Один основной запуск
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .[dev]
 PYTHONPATH=src python3 sgr_demo.py
 ```
 
-Это единственный основной сценарий запуска demo в проекте.
+## Главные файлы
+- Core бизнес-логики: `src/dialogs/sgr_core.py`
+- Отдельный judge-pass: `src/dialogs/llm_as_judge.py`
+- Оркестрация run/report: `src/dialogs/pipeline.py`
+- Тесты-документация: `tests/test_platform_dataset_style.py`
+- JSON schema regression: `tests/test_json_schema_regression.py`
+- SQL аналитика: `docs/analytics_sql.md`
 
-## Где основная логика и документация
-- Кор бизнес-логики SGR: `src/dialogs/sgr_core.py`
-- Основные тесты-документация кейсов: `tests/test_platform_dataset_style.py`
-- Regression тест strict JSON schema: `tests/test_json_schema_regression.py`
-
-## Проверка
+## Быстрые команды
 ```bash
-PYTHONPATH=src .venv/bin/pytest -q
+make init-fresh
+make scan
+make report
+make test
 ```

@@ -1,31 +1,20 @@
 from __future__ import annotations
 
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict, Field  # type: ignore
-
-
-class CompiledRuleSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    rule_key: str = Field(min_length=1)
-    title: str = Field(min_length=1)
-    scope: Literal["message", "conversation"]
-    target_speaker: Literal["sales_rep", "customer", "any"]
-    logic: Literal["keyword_any", "keyword_all"]
-    include_keywords: list[str]
-    exclude_keywords: list[str]
-    reason_template: str
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Evidence(BaseModel):
+    """Ссылка на источник: точная цитата из конкретного сообщения."""
+
     model_config = ConfigDict(extra="forbid")
 
     quote: str
     message_id: int
 
 
-class RuleEvaluation(BaseModel):
+class EvaluatorResult(BaseModel):
+    """Ответ evaluator для одного сообщения и одного правила."""
+
     model_config = ConfigDict(extra="forbid")
 
     hit: bool
@@ -34,18 +23,11 @@ class RuleEvaluation(BaseModel):
     reason: str
 
 
-class JudgeDecision(BaseModel):
+class JudgeResult(BaseModel):
+    """Ответ judge: evaluator прав или нет для данного случая."""
+
     model_config = ConfigDict(extra="forbid")
 
     label: bool
     confidence: float = Field(ge=0, le=1)
     rationale: str
-
-
-class SGRStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    current_state: str
-    plan_remaining_steps_brief: list[str] = Field(min_length=1, max_length=5)
-    task_completed: bool
-    function: RuleEvaluation

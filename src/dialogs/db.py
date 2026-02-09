@@ -8,6 +8,16 @@ from .utils import now_utc
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS review_items;
+DROP TABLE IF EXISTS review_cases;
+DROP TABLE IF EXISTS rule_results;
+DROP TABLE IF EXISTS experiment_metrics;
+DROP TABLE IF EXISTS experiment_runs;
+DROP TABLE IF EXISTS rule_versions;
+DROP TABLE IF EXISTS rules;
+DROP TABLE IF EXISTS llm_runs;
+DROP TABLE IF EXISTS llm_calls;
+
 CREATE TABLE IF NOT EXISTS conversations (
   conversation_id TEXT PRIMARY KEY,
   source_file_name TEXT NOT NULL UNIQUE,
@@ -32,97 +42,57 @@ CREATE TABLE IF NOT EXISTS messages (
   FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
 );
 
-CREATE TABLE IF NOT EXISTS rules (
-  rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  rule_key TEXT NOT NULL UNIQUE,
-  natural_language TEXT NOT NULL,
-  language TEXT NOT NULL,
-  status TEXT NOT NULL,
-  compile_error TEXT NOT NULL DEFAULT '',
-  created_at_utc TEXT NOT NULL,
-  updated_at_utc TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS rule_versions (
-  version_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  rule_id INTEGER NOT NULL,
-  version_no INTEGER NOT NULL,
-  compiled_spec_json TEXT NOT NULL,
-  prompt_version TEXT NOT NULL,
-  created_at_utc TEXT NOT NULL,
-  UNIQUE(rule_id, version_no),
-  FOREIGN KEY(rule_id) REFERENCES rules(rule_id)
-);
-
-CREATE TABLE IF NOT EXISTS experiment_runs (
+CREATE TABLE IF NOT EXISTS scan_runs (
   run_id TEXT PRIMARY KEY,
-  mode TEXT NOT NULL,
-  rule_set TEXT NOT NULL,
   model TEXT NOT NULL,
-  git_commit TEXT NOT NULL,
-  git_branch TEXT NOT NULL,
-  prompt_version TEXT NOT NULL,
-  sgr_version TEXT NOT NULL,
-  started_at_utc TEXT NOT NULL,
-  finished_at_utc TEXT NOT NULL,
+  conversation_from INTEGER NOT NULL,
+  conversation_to INTEGER NOT NULL,
+  selected_conversations INTEGER NOT NULL,
+  messages_count INTEGER NOT NULL,
   status TEXT NOT NULL,
+  started_at_utc TEXT NOT NULL,
+  finished_at_utc TEXT NOT NULL DEFAULT '',
   summary_json TEXT NOT NULL DEFAULT '{}'
 );
 
-CREATE TABLE IF NOT EXISTS experiment_metrics (
+CREATE TABLE IF NOT EXISTS scan_results (
+  result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  rule_key TEXT NOT NULL,
+  eval_hit INTEGER NOT NULL,
+  eval_confidence REAL NOT NULL,
+  evidence_quote TEXT NOT NULL,
+  evidence_message_id INTEGER NOT NULL,
+  eval_reason TEXT NOT NULL,
+  judge_label INTEGER,
+  judge_confidence REAL,
+  judge_rationale TEXT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  UNIQUE(run_id, message_id, rule_key),
+  FOREIGN KEY(run_id) REFERENCES scan_runs(run_id),
+  FOREIGN KEY(message_id) REFERENCES messages(message_id)
+);
+
+CREATE TABLE IF NOT EXISTS scan_metrics (
   metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL,
   rule_key TEXT NOT NULL,
   metric_name TEXT NOT NULL,
   metric_value REAL NOT NULL,
   created_at_utc TEXT NOT NULL,
-  FOREIGN KEY(run_id) REFERENCES experiment_runs(run_id)
-);
-
-CREATE TABLE IF NOT EXISTS rule_results (
-  result_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id TEXT NOT NULL,
-  rule_id INTEGER NOT NULL,
-  version_id INTEGER NOT NULL,
-  conversation_id TEXT NOT NULL,
-  message_id INTEGER NOT NULL,
-  mode TEXT NOT NULL,
-  hit INTEGER NOT NULL,
-  confidence REAL NOT NULL,
-  evidence TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  judge_label INTEGER,
-  judge_confidence REAL,
-  judge_rationale TEXT,
-  created_at_utc TEXT NOT NULL,
-  FOREIGN KEY(run_id) REFERENCES experiment_runs(run_id),
-  FOREIGN KEY(rule_id) REFERENCES rules(rule_id),
-  FOREIGN KEY(version_id) REFERENCES rule_versions(version_id),
-  FOREIGN KEY(message_id) REFERENCES messages(message_id)
-);
-
-CREATE TABLE IF NOT EXISTS llm_runs (
-  run_id TEXT PRIMARY KEY,
-  run_kind TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  model TEXT NOT NULL,
-  git_commit TEXT NOT NULL,
-  git_branch TEXT NOT NULL,
-  prompt_version TEXT NOT NULL,
-  sgr_version TEXT NOT NULL,
-  started_at_utc TEXT NOT NULL,
-  finished_at_utc TEXT NOT NULL,
-  status TEXT NOT NULL,
-  meta_json TEXT NOT NULL DEFAULT '{}'
+  FOREIGN KEY(run_id) REFERENCES scan_runs(run_id)
 );
 
 CREATE TABLE IF NOT EXISTS llm_calls (
   call_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL,
-  rule_id INTEGER,
+  phase TEXT NOT NULL,
+  rule_key TEXT NOT NULL DEFAULT '',
   conversation_id TEXT NOT NULL DEFAULT '',
   message_id INTEGER NOT NULL DEFAULT 0,
-  phase TEXT NOT NULL,
   attempt INTEGER NOT NULL,
   request_json TEXT NOT NULL,
   response_http_status INTEGER NOT NULL,
@@ -132,39 +102,19 @@ CREATE TABLE IF NOT EXISTS llm_calls (
   validation_ok INTEGER NOT NULL,
   error_message TEXT NOT NULL DEFAULT '',
   latency_ms INTEGER NOT NULL DEFAULT 0,
-  tokens_json TEXT NOT NULL DEFAULT '{}',
-  created_at_utc TEXT NOT NULL,
-  FOREIGN KEY(run_id) REFERENCES llm_runs(run_id)
+  created_at_utc TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS review_cases (
-  case_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  business_area TEXT NOT NULL,
-  status TEXT NOT NULL,
-  created_at_utc TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
   updated_at_utc TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS review_items (
-  item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  case_id INTEGER NOT NULL,
-  conversation_id TEXT NOT NULL,
-  message_id INTEGER NOT NULL,
-  decision TEXT NOT NULL,
-  note TEXT NOT NULL DEFAULT '',
-  created_at_utc TEXT NOT NULL,
-  updated_at_utc TEXT NOT NULL,
-  UNIQUE(case_id, message_id),
-  FOREIGN KEY(case_id) REFERENCES review_cases(case_id),
-  FOREIGN KEY(message_id) REFERENCES messages(message_id)
-);
-
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(conversation_id, message_order);
-CREATE INDEX IF NOT EXISTS idx_rules_status ON rules(status);
-CREATE INDEX IF NOT EXISTS idx_rule_results_run_rule ON rule_results(run_id, rule_id);
+CREATE INDEX IF NOT EXISTS idx_scan_results_run_rule ON scan_results(run_id, rule_key);
+CREATE INDEX IF NOT EXISTS idx_scan_metrics_run_rule ON scan_metrics(run_id, rule_key, metric_name);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run_phase ON llm_calls(run_id, phase);
-CREATE INDEX IF NOT EXISTS idx_experiment_metrics_run ON experiment_metrics(run_id, rule_key, metric_name);
 """
 
 
@@ -186,37 +136,40 @@ def init_db(db_path: str) -> None:
 def replace_all_data(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
-        DELETE FROM rule_results;
-        DELETE FROM experiment_metrics;
-        DELETE FROM experiment_runs;
+        DELETE FROM scan_results;
+        DELETE FROM scan_metrics;
         DELETE FROM llm_calls;
-        DELETE FROM llm_runs;
-        DELETE FROM review_items;
-        DELETE FROM review_cases;
+        DELETE FROM scan_runs;
+        DELETE FROM app_state;
         DELETE FROM messages;
         DELETE FROM conversations;
         """
     )
 
 
+def reset_run_data(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        DELETE FROM scan_results;
+        DELETE FROM scan_metrics;
+        DELETE FROM llm_calls;
+        DELETE FROM scan_runs;
+        DELETE FROM app_state WHERE key='canonical_run_id';
+        """
+    )
+    conn.commit()
+
+
 def db_stats(conn: sqlite3.Connection) -> dict[str, int]:
     keys = [
         "conversations",
         "messages",
-        "rules",
-        "rule_versions",
-        "rule_results",
-        "llm_runs",
+        "scan_runs",
+        "scan_results",
+        "scan_metrics",
         "llm_calls",
-        "review_cases",
-        "review_items",
-        "experiment_runs",
-        "experiment_metrics",
     ]
-    out: dict[str, int] = {}
-    for key in keys:
-        out[key] = conn.execute(f"SELECT COUNT(*) FROM {key}").fetchone()[0]
-    return out
+    return {key: int(conn.execute(f"SELECT COUNT(*) FROM {key}").fetchone()[0]) for key in keys}
 
 
 def touch_conversation_counts(conn: sqlite3.Connection) -> None:
@@ -231,3 +184,20 @@ def touch_conversation_counts(conn: sqlite3.Connection) -> None:
         """,
         (now,),
     )
+
+
+def get_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO app_state(key, value, updated_at_utc)
+        VALUES(?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at_utc=excluded.updated_at_utc
+        """,
+        (key, value, now_utc()),
+    )
+    conn.commit()

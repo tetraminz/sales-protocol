@@ -4,10 +4,9 @@ import argparse
 import os
 
 from .db import connect, init_db
-from .eval import run_diff, run_eval
 from .ingest import ingest_csv_dir
 from .llm import LLMClient
-from .rules import seed_default_rules
+from .pipeline import build_report, run_scan
 
 
 def run_demo(
@@ -16,36 +15,23 @@ def run_demo(
     conversation_from: int = 0,
     conversation_to: int = 4,
 ) -> dict[str, str]:
-    """Minimal executive demo: ingest -> baseline -> sgr -> diff."""
     init_db(db_path)
     llm = LLMClient(model="gpt-4.1-mini", api_key=os.getenv("OPENAI_API_KEY", ""))
 
     with connect(db_path) as conn:
-        seed_default_rules(conn)
         ingest_csv_dir(conn, csv_dir=csv_dir, replace=True)
-        baseline_id = run_eval(
+        run_id = run_scan(
             conn,
             llm=llm,
-            mode="baseline",
-            rule_set="default",
-            prompt_version="v1",
-            sgr_version="v1",
             conversation_from=conversation_from,
             conversation_to=conversation_to,
         )
-        sgr_id = run_eval(
-            conn,
-            llm=llm,
-            mode="sgr",
-            rule_set="default",
-            prompt_version="v1",
-            sgr_version="v1",
-            conversation_from=conversation_from,
-            conversation_to=conversation_to,
-        )
-        run_diff(conn, run_a=baseline_id, run_b=sgr_id, png_path="artifacts/accuracy_diff.png", md_path="artifacts/metrics.md")
+        report = build_report(conn, run_id=run_id)
 
-    return {"baseline_run": baseline_id, "sgr_run": sgr_id}
+    return {
+        "run_id": run_id,
+        "canonical_run_id": str(report["canonical_run_id"]),
+    }
 
 
 if __name__ == "__main__":
@@ -61,4 +47,4 @@ if __name__ == "__main__":
         conversation_from=args.conversation_from,
         conversation_to=args.conversation_to,
     )
-    print(f"demo_ok baseline={result['baseline_run']} sgr={result['sgr_run']}")
+    print(f"demo_ok run={result['run_id']} canonical={result['canonical_run_id']}")
