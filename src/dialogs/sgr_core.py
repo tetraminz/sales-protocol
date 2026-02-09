@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-"""Core-бизнес логика SGR.
+"""Core-бизнес логика SGR для оценки качества диалогов продаж.
 
-Этот модуль - единая точка, где зафиксированы:
-- бизнес-правила оценки продавца;
-- политика prompt-ов evaluator/judge;
-- проверки evidence и soft-флаги консистентности judge.
+Роль модуля в пайплайне:
+1. хранит бизнес-контракт правил (`greeting`, `upsell`, `empathy`) и порогов качества;
+2. собирает контролируемые prompt-ы evaluator/judge для предсказуемого reasoning;
+3. валидирует evidence и выявляет мягкие противоречия в вердиктах judge;
+4. отдает единые helper-функции для отчетов, heatmap и интерпретации метрик.
+
+Границы ответственности:
+- здесь нет вызовов LLM, SQL и I/O;
+- модуль формирует правила и проверки, которые используют `pipeline.py` и отчеты;
+- изменение констант в этом файле является продуктовым решением и влияет на метрики.
 """
 
 from collections.abc import Sequence
@@ -20,6 +26,8 @@ METRICS_VERSION = "v3_minimal_judge_correctness"
 
 @dataclass(frozen=True)
 class RuleCard:
+    """Карточка одного бизнес-правила оценки сообщения продавца."""
+
     key: str
     title_ru: str
     what_to_check: str
@@ -28,6 +36,8 @@ class RuleCard:
 
 @dataclass(frozen=True)
 class QualityThresholds:
+    """Пороговые значения зон качества для heatmap и executive-отчетов."""
+
     green_min: float = 0.90
     yellow_min: float = 0.80
     rule_alert_min: float = 0.85
@@ -35,6 +45,7 @@ class QualityThresholds:
 
 
 # Бизнес-каталог правил намеренно жесткий: это контракт системы и тестов.
+# "что считаем хорошим ответом продавца".
 RULES: tuple[RuleCard, ...] = (
     RuleCard(
         key="greeting",
@@ -56,14 +67,18 @@ RULES: tuple[RuleCard, ...] = (
     ),
 )
 
+# Пороги зон задают одинаковый язык для продукта, аналитики и инженеров.
 QUALITY_THRESHOLDS = QualityThresholds()
 
+# reason_code - аудируемая причина решения evaluator.
+# Фиксированный словарь снижает вариативность и упрощает BI-аналитику.
 RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
     "greeting": ("greeting_present", "greeting_missing"),
     "upsell": ("upsell_offer", "upsell_missing", "discount_without_upsell"),
     "empathy": ("empathy_acknowledged", "courtesy_without_empathy", "informational_without_empathy"),
 }
 
+# Антипаттерны фиксируют частые ложные срабатывания, которые важны для бизнеса.
 RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
     "upsell": (
         "Скидка/промокод без новой опции не считается допродажей.",
@@ -81,14 +96,20 @@ _NEGATIVE_RATIONALE_MARKERS = ("некоррект", "ошиб", "incorrect")
 
 
 def all_rules() -> tuple[RuleCard, ...]:
+    """Возвращает неизменяемый каталог правил оценки продавца."""
+
     return RULES
 
 
 def quality_thresholds() -> QualityThresholds:
+    """Возвращает централизованные пороги качества для всех отчетов."""
+
     return QUALITY_THRESHOLDS
 
 
 def heatmap_zone(score: float | None, *, thresholds: QualityThresholds | None = None) -> str:
+    """Классифицирует score в зону качества: green/yellow/red/na."""
+
     cfg = thresholds or QUALITY_THRESHOLDS
     if score is None:
         return "na"
@@ -100,6 +121,8 @@ def heatmap_zone(score: float | None, *, thresholds: QualityThresholds | None = 
 
 
 def threshold_doc_line(*, thresholds: QualityThresholds | None = None) -> str:
+    """Форматирует одну строку с правилами зон для markdown-отчетов."""
+
     cfg = thresholds or QUALITY_THRESHOLDS
     return (
         f"green >= {cfg.green_min:.2f}, "
@@ -109,10 +132,17 @@ def threshold_doc_line(*, thresholds: QualityThresholds | None = None) -> str:
 
 
 def is_seller_message(speaker_label: str) -> bool:
+    """True только для реплик продавца, которые участвуют в оценке."""
+
     return speaker_label == "Sales Rep"
 
 
 def build_chat_context(conversation_messages: Sequence[object], *, current_message_order: int) -> str:
+    """Собирает контекст диалога до текущего сообщения включительно.
+
+    Ограничение по `current_message_order` исключает утечку "будущих" реплик
+    в evaluator/judge и сохраняет корректность бизнес-оценки.
+    """
     # Контекст для evaluator/judge: только сообщения до текущего шага включительно.
     lines: list[str] = []
     for item in conversation_messages:
@@ -131,6 +161,8 @@ def _reason_codes_for_rule(rule_key: str) -> str:
 
 
 def default_reason_code(rule_key: str, *, hit: bool) -> ReasonCode:
+    """Возвращает reason_code по умолчанию, если payload evaluator недоступен."""
+
     # Фолбэк нужен для единичных случаев, когда evaluator payload отсутствует в кэше.
     if rule_key == "greeting":
         return "greeting_present" if hit else "greeting_missing"
@@ -154,6 +186,13 @@ def build_evaluator_prompts(
     message_id: int,
     chat_context: str,
 ) -> tuple[str, str]:
+    """Формирует system/user prompt для evaluator по одному правилу.
+
+    Prompt принудительно закрепляет:
+    - использование словаря reason_code;
+    - строгие требования к evidence;
+    - проверку empathy через chat context, а не по одному сообщению.
+    """
     anti_patterns = _rule_anti_patterns(rule.key)
     system_prompt = (
         "Ты evaluator качества продаж. "
@@ -190,6 +229,11 @@ def build_judge_prompts(
     chat_context: str,
     evaluator: EvaluatorResult,
 ) -> tuple[str, str]:
+    """Формирует prompt judge для проверки корректности evaluator.
+
+    Judge сначала определяет независимый `expected_hit`, затем оценивает label.
+    Такая последовательность делает вывод audit-friendly для бизнеса.
+    """
     system_prompt = (
         "Ты независимый judge качества. "
         "Сначала определи expected_hit по правилу и контексту. "
@@ -214,6 +258,8 @@ def build_judge_prompts(
 
 
 def build_evidence_correction_note(message_id: int) -> str:
+    """Возвращает инструкцию для повторного evaluator-вызова при bad evidence."""
+
     return (
         "Коррекция evidence:\n"
         f"- evidence.message_id должен быть равен {int(message_id)}\n"
@@ -225,6 +271,11 @@ def build_evidence_correction_note(message_id: int) -> str:
 
 
 def normalize_evidence_span(result: EvaluatorResult, *, text: str) -> EvaluatorResult:
+    """Исправляет только индексы evidence, если quote уже корректный.
+
+    Функция сознательно не меняет quote: она безопасно чинит технический сдвиг
+    span_start/span_end и сохраняет исходный смысл оценки.
+    """
     # Авто-фикс безопасен только когда quote корректный, а ошибка только в индексах.
     if not result.hit:
         return result
@@ -257,6 +308,10 @@ def normalize_evidence_span(result: EvaluatorResult, *, text: str) -> EvaluatorR
 
 
 def evidence_error(result: EvaluatorResult, *, message_id: int, text: str) -> str | None:
+    """Проверяет referential integrity evidence и возвращает текст ошибки.
+
+    Возвращает `None`, если evidence консистентен или hit=false.
+    """
     if not result.hit:
         return None
 
@@ -281,6 +336,11 @@ def evidence_error(result: EvaluatorResult, *, message_id: int, text: str) -> st
 
 
 def judge_inconsistency_flags(*, evaluator_hit: bool, judge: JudgeResult) -> list[str]:
+    """Находит мягкие противоречия между полями judge.
+
+    Флаги не ломают пайплайн, но помогают быстро увидеть риск качества
+    reasoning в executive/engineering отчете.
+    """
     flags: list[str] = []
     expected_label = evaluator_hit == judge.expected_hit
     if bool(judge.label) != bool(expected_label):
