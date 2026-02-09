@@ -1,3 +1,18 @@
+Metadata-Version: 2.4
+Name: dialogs-sgr
+Version: 0.1.0
+Summary: Python-only SGR platform for dialog quality with SQLite and tiny CLI
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: openai>=1.58.0
+Requires-Dist: pydantic>=2.9.0
+Requires-Dist: Pillow>=10.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+Requires-Dist: jupyter>=1.1.1; extra == "dev"
+Requires-Dist: ipykernel>=6.29.5; extra == "dev"
+Requires-Dist: pandas>=2.2.0; extra == "dev"
+
 # dialogs-sgr
 
 Минимальный SGR-сканер для 3 hardcoded правил (`greeting`, `upsell`, `empathy`) с SQLite, evaluator и `llm as judge`.
@@ -6,7 +21,6 @@
 ```bash
 make setup
 make init-fresh
-export OPENAI_API_KEY=...
 make scan
 make report
 make test

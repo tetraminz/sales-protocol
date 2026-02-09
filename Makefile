@@ -1,37 +1,42 @@
-DB ?= out/annotations.db
-INPUT_DIR ?= sales-transcripts/data/chunked_transcripts
-FROM ?= 1
-TO ?= 20
+DB ?= dialogs.db
+CSV_DIR ?= csv
 MODEL ?= gpt-4.1-mini
+CONVERSATION_FROM ?= 0
+CONVERSATION_TO ?= 4
+VENV_PY ?= .venv/bin/python
+PY ?= $(VENV_PY)
+PYPATH ?= PYTHONPATH=src
 
-.PHONY: help setup annotate analytics debug-release report release-check test
-
-help:
-	@echo "Targets:"
-	@echo "  make setup DB=out/annotations.db"
-	@echo "  OPENAI_API_KEY=... make annotate DB=out/annotations.db INPUT_DIR=sales-transcripts/data/chunked_transcripts FROM=1 TO=20 MODEL=gpt-4.1-mini"
-	@echo "  make analytics DB=out/annotations.db"
-	@echo "  make debug-release DB=out/annotations.db"
-	@echo "  make report DB=out/annotations.db"
-	@echo "  make release-check"
-	@echo "  make test"
+.PHONY: setup init-fresh reset-runs scan report demo stats test notebook
 
 setup:
-	go run . setup --db "$(DB)"
+	[ -x "$(VENV_PY)" ] || python3 -m venv .venv
+	$(VENV_PY) -m pip install --upgrade pip
+	$(VENV_PY) -m pip install -e '.[dev]'
+	$(VENV_PY) -m ipykernel install --user --name dialogs-sgr --display-name "Python (dialogs-sgr)"
 
-annotate:
-	go run . annotate --db "$(DB)" --input_dir "$(INPUT_DIR)" --from_idx "$(FROM)" --to_idx "$(TO)" --model "$(MODEL)"
+init-fresh:
+	rm -f "$(DB)"
+	$(PYPATH) $(PY) -m dialogs.main db init --db "$(DB)"
+	$(PYPATH) $(PY) -m dialogs.main data ingest-csv --db "$(DB)" --csv-dir "$(CSV_DIR)" --replace
 
-analytics:
-	go run . analytics --db "$(DB)" --out "out/analytics_latest.md"
+reset-runs:
+	$(PYPATH) $(PY) -m dialogs.main db reset-runs --db "$(DB)"
 
-debug-release:
-	go run . debug-release --db "$(DB)" --out "out/release_debug_latest.md"
+scan:
+	$(PYPATH) $(PY) -m dialogs.main run scan --db "$(DB)" --model "$(MODEL)" --conversation-from "$(CONVERSATION_FROM)" --conversation-to "$(CONVERSATION_TO)"
 
 report:
-	go run . report --db "$(DB)"
+	$(PYPATH) $(PY) -m dialogs.main run report --db "$(DB)" --md artifacts/metrics.md --png artifacts/accuracy_diff.png
 
-release-check: annotate analytics debug-release report
+stats:
+	$(PYPATH) $(PY) -m dialogs.main db stats --db "$(DB)"
+
+demo:
+	$(PYPATH) $(PY) sgr_demo.py
 
 test:
-	go test ./...
+	$(PYPATH) $(PY) -m pytest -q
+
+notebook:
+	$(PY) -m jupyter lab
