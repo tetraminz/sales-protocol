@@ -7,25 +7,28 @@ from typing import Any
 
 from .db import get_state, set_state
 from .llm import LLMClient
-from .models import Evidence, EvaluatorResult, JudgeResult
+from .models import BundledEvaluatorResult, BundledJudgeResult
 from .report_image import write_accuracy_diff_png
 from .sgr_core import (
     METRICS_VERSION,
     all_rules,
     build_chat_context,
-    build_evaluator_prompts,
-    build_evidence_correction_note,
-    build_judge_prompts,
-    default_reason_code,
-    evidence_error,
+    build_evaluator_prompts_bundle,
+    build_judge_prompts_bundle,
+    evaluator_results_by_rule,
     heatmap_zone,
     is_seller_message,
-    judge_inconsistency_flags,
-    normalize_evidence_span,
+    judge_results_by_rule,
+    previous_customer_message,
     quality_thresholds,
     threshold_doc_line,
 )
 from .utils import ensure_parent, jdump, now_utc
+
+FIXED_BUNDLE_RULES = True
+FIXED_JUDGE_MODE = "full"
+FIXED_CONTEXT_MODE = "full"
+FIXED_LLM_TRACE = "full"
 
 
 def load_messages_for_range(
@@ -65,23 +68,6 @@ def load_messages_for_range(
     if not messages:
         raise ValueError("selected conversations contain no messages")
     return ids, messages
-
-
-def _warn_non_schema(counters: dict[str, int], *, phase: str, rule_key: str, error: str) -> None:
-    counters["non_schema_errors"] += 1
-    counters["skipped_due_to_errors"] += 1
-    if counters["non_schema_errors"] <= 3:
-        print(f"[scan][warn] phase={phase} rule={rule_key} err={error}")
-    elif counters["non_schema_errors"] == 4:
-        print("[scan][warn] additional non-schema errors suppressed")
-
-
-def _warn_soft_flag(counters: dict[str, int], *, rule_key: str, message_id: int, flags: list[str]) -> None:
-    counters["judge_inconsistency_soft_flags"] += 1
-    if counters["judge_inconsistency_soft_flags"] <= 3:
-        print(f"[scan][soft-flag] rule={rule_key} msg={message_id} flags={','.join(flags)}")
-    elif counters["judge_inconsistency_soft_flags"] == 4:
-        print("[scan][soft-flag] additional judge inconsistencies suppressed")
 
 
 def _insert_run(
@@ -140,48 +126,14 @@ def _run_metrics_version(conn: sqlite3.Connection, *, run_id: str | None) -> str
     return None if value in (None, "") else str(value)
 
 
-def _span_from_quote(*, text: str, quote: str) -> tuple[int, int]:
-    if not quote:
-        return 0, 0
-    idx = text.find(quote)
-    if idx < 0:
-        return 0, 0
-    return idx, idx + len(quote)
-
-
-def _fallback_evaluator_result(row: sqlite3.Row) -> EvaluatorResult:
-    text = str(row["text"])
-    quote = str(row["evidence_quote"])
-
-    span_start = row["evidence_span_start"]
-    span_end = row["evidence_span_end"]
-    if span_start is None or span_end is None:
-        span_start, span_end = _span_from_quote(text=text, quote=quote)
-
-    reason_code = str(row["eval_reason_code"] or "")
-    if not reason_code:
-        reason_code = default_reason_code(str(row["rule_key"]), hit=bool(row["eval_hit"]))
-
-    return EvaluatorResult(
-        hit=bool(row["eval_hit"]),
-        confidence=float(row["eval_confidence"]),
-        evidence=Evidence(
-            quote=quote,
-            message_id=int(row["evidence_message_id"]),
-            span_start=int(span_start),
-            span_end=int(span_end),
-        ),
-        reason_code=reason_code,  # type: ignore[arg-type]
-        reason=str(row["eval_reason"]),
-    )
-
-
 def _compute_metrics(conn: sqlite3.Connection, *, run_id: str) -> None:
     conn.execute("DELETE FROM scan_metrics WHERE run_id=?", (run_id,))
     for rule in all_rules():
         row = conn.execute(
             """
             SELECT
+              COUNT(*) AS eval_total,
+              SUM(CASE WHEN eval_hit=1 THEN 1 ELSE 0 END) AS eval_true,
               SUM(CASE WHEN judge_label=1 THEN 1 ELSE 0 END) AS judge_true,
               SUM(CASE WHEN judge_label=0 THEN 1 ELSE 0 END) AS judge_false,
               SUM(CASE WHEN judge_label IS NOT NULL THEN 1 ELSE 0 END) AS judged_total
@@ -191,28 +143,43 @@ def _compute_metrics(conn: sqlite3.Connection, *, run_id: str) -> None:
             (run_id, rule.key),
         ).fetchone()
 
+        eval_total = int(row["eval_total"] or 0)
+        eval_true = int(row["eval_true"] or 0)
         judge_true = int(row["judge_true"] or 0)
         judge_false = int(row["judge_false"] or 0)
         judged_total = int(row["judged_total"] or 0)
+
+        evaluator_hit_rate = _safe_div(float(eval_true), float(eval_total))
         judge_correctness = _safe_div(float(judge_true), float(judged_total))
+        judge_coverage = _safe_div(float(judged_total), float(eval_total))
 
         conn.execute(
             """
             INSERT INTO scan_metrics(
-              run_id, rule_key, judge_correctness, judged_total, judge_true, judge_false, created_at_utc
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+              run_id, rule_key, eval_total, eval_true, evaluator_hit_rate,
+              judge_correctness, judge_coverage, judged_total, judge_true, judge_false, created_at_utc
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
                 rule.key,
+                eval_total,
+                eval_true,
+                float(evaluator_hit_rate),
                 float(judge_correctness),
-                int(judged_total),
-                int(judge_true),
-                int(judge_false),
+                float(judge_coverage),
+                judged_total,
+                judge_true,
+                judge_false,
                 now_utc(),
             ),
         )
     conn.commit()
+
+
+def _llm_error_or_raise(*, phase: str, call_error: str, is_schema_error: bool) -> None:
+    err_type = "schema_error" if is_schema_error else "live_error"
+    raise ValueError(f"{err_type} phase={phase}: {call_error}")
 
 
 def run_scan(
@@ -221,8 +188,13 @@ def run_scan(
     llm: LLMClient,
     conversation_from: int = 0,
     conversation_to: int = 4,
+    run_id_override: str | None = None,
 ) -> str:
     llm.require_live("run scan")
+    bundle_rules = FIXED_BUNDLE_RULES
+    judge_mode = FIXED_JUDGE_MODE
+    context_mode = FIXED_CONTEXT_MODE
+    llm_trace = FIXED_LLM_TRACE
 
     conversation_ids, messages = load_messages_for_range(
         conn,
@@ -234,7 +206,7 @@ def run_scan(
         by_conversation.setdefault(str(message["conversation_id"]), []).append(message)
 
     rules = all_rules()
-    run_id = f"scan_{uuid.uuid4().hex[:12]}"
+    run_id = run_id_override or f"scan_{uuid.uuid4().hex[:12]}"
     seller_messages = sum(1 for msg in messages if is_seller_message(str(msg["speaker_label"])))
     _insert_run(
         conn,
@@ -247,14 +219,12 @@ def run_scan(
     )
 
     counters = {
+        "seller_turns": 0,
         "processed": 0,
         "inserted": 0,
         "judged": 0,
-        "skipped_due_to_errors": 0,
-        "evidence_mismatch_skipped": 0,
         "schema_errors": 0,
         "non_schema_errors": 0,
-        "judge_inconsistency_soft_flags": 0,
     }
     summary = {
         "conversation_from": conversation_from,
@@ -265,213 +235,167 @@ def run_scan(
         "customer_messages_context_only": len(messages) - seller_messages,
         "rules": len(rules),
         "metrics_version": METRICS_VERSION,
+        "bundle_rules": bool(bundle_rules),
+        "judge_mode": judge_mode,
+        "context_mode": context_mode,
+        "llm_trace": llm_trace,
     }
 
     print(
         f"[scan] conversations={len(conversation_ids)} messages={len(messages)} seller_messages={seller_messages} "
-        f"rules={len(rules)} range={conversation_from}..{conversation_to}"
+        f"rules={len(rules)} range={conversation_from}..{conversation_to} "
+        f"bundle_rules={bundle_rules} judge_mode={judge_mode} context_mode={context_mode} llm_trace={llm_trace}"
     )
 
     status = "failed"
     conv_pos = {cid: idx + 1 for idx, cid in enumerate(conversation_ids)}
-    context_by_message_id: dict[int, str] = {}
-    evaluator_cache: dict[tuple[str, int, str], EvaluatorResult] = {}
     try:
         for conversation_id in conversation_ids:
             conversation_messages = by_conversation.get(conversation_id, [])
-            print(f"[scan] evaluator conversation {conv_pos[conversation_id]}/{len(conversation_ids)} id={conversation_id}")
+            print(f"[scan] conversation {conv_pos[conversation_id]}/{len(conversation_ids)} id={conversation_id}")
 
             for message in conversation_messages:
                 if not is_seller_message(str(message["speaker_label"])):
                     continue
 
-                message_id = int(message["message_id"])
-                message_text = str(message["text"])
-                chat_context = build_chat_context(
+                seller_message_id = int(message["message_id"])
+                seller_text = str(message["text"])
+                previous_customer = previous_customer_message(
                     conversation_messages,
                     current_message_order=int(message["message_order"]),
                 )
-                context_by_message_id[message_id] = chat_context
+                customer_message_id = None if previous_customer is None else int(previous_customer["message_id"])
+                customer_text = "" if previous_customer is None else str(previous_customer["text"])
+                chat_context = build_chat_context(
+                    conversation_messages,
+                    current_message_order=int(message["message_order"]),
+                    mode=context_mode,
+                )
+
+                counters["seller_turns"] += 1
+                counters["processed"] += len(rules)
+
+                eval_sys, eval_user = build_evaluator_prompts_bundle(
+                    rules,
+                    seller_message_id=seller_message_id,
+                    seller_text=seller_text,
+                    customer_text=customer_text,
+                    chat_context=chat_context,
+                    context_mode=context_mode,
+                )
+                eval_call = llm.call_json_schema(
+                    conn,
+                    run_id=run_id,
+                    phase="evaluator",
+                    rule_key="bundle",
+                    conversation_id=conversation_id,
+                    message_id=seller_message_id,
+                    model_type=BundledEvaluatorResult,
+                    system_prompt=eval_sys,
+                    user_prompt=eval_user,
+                    attempt=1,
+                )
+                if eval_call.error_message:
+                    if eval_call.is_schema_error:
+                        counters["schema_errors"] += 1
+                    else:
+                        counters["non_schema_errors"] += 1
+                    _llm_error_or_raise(
+                        phase="evaluator",
+                        call_error=eval_call.error_message,
+                        is_schema_error=eval_call.is_schema_error,
+                    )
+                if not isinstance(eval_call.parsed, BundledEvaluatorResult):
+                    counters["schema_errors"] += 1
+                    raise ValueError("schema_error evaluator payload type mismatch")
+
+                eval_by_rule = evaluator_results_by_rule(eval_call.parsed)
+                for rule in rules:
+                    eval_result = eval_by_rule[rule.key]
+                    evidence_quote = str(eval_result.evidence_quote).strip()
+                    if bool(eval_result.hit) and (not evidence_quote or evidence_quote not in seller_text):
+                        counters["schema_errors"] += 1
+                        raise ValueError(
+                            f"schema_error evaluator evidence_quote is not substring of seller_text "
+                            f"(rule={rule.key}, seller_message_id={seller_message_id})"
+                        )
+
+                judge_sys, judge_user = build_judge_prompts_bundle(
+                    rules,
+                    seller_text=seller_text,
+                    customer_text=customer_text,
+                    chat_context=chat_context,
+                    evaluator=eval_call.parsed,
+                    context_mode=context_mode,
+                )
+                judge_call = llm.call_json_schema(
+                    conn,
+                    run_id=run_id,
+                    phase="judge",
+                    rule_key="bundle",
+                    conversation_id=conversation_id,
+                    message_id=seller_message_id,
+                    model_type=BundledJudgeResult,
+                    system_prompt=judge_sys,
+                    user_prompt=judge_user,
+                    attempt=1,
+                )
+                if judge_call.error_message:
+                    if judge_call.is_schema_error:
+                        counters["schema_errors"] += 1
+                    else:
+                        counters["non_schema_errors"] += 1
+                    _llm_error_or_raise(
+                        phase="judge",
+                        call_error=judge_call.error_message,
+                        is_schema_error=judge_call.is_schema_error,
+                    )
+                if not isinstance(judge_call.parsed, BundledJudgeResult):
+                    counters["schema_errors"] += 1
+                    raise ValueError("schema_error judge payload type mismatch")
+                judge_by_rule = judge_results_by_rule(judge_call.parsed)
 
                 for rule in rules:
-                    counters["processed"] += 1
-                    sys_prompt, user_prompt = build_evaluator_prompts(
-                        rule,
-                        speaker_label=str(message["speaker_label"]),
-                        text=message_text,
-                        message_id=message_id,
-                        chat_context=chat_context,
-                    )
-                    call = llm.call_json_schema(
-                        conn,
-                        run_id=run_id,
-                        phase="evaluator",
-                        rule_key=rule.key,
-                        conversation_id=conversation_id,
-                        message_id=message_id,
-                        model_type=EvaluatorResult,
-                        system_prompt=sys_prompt,
-                        user_prompt=user_prompt,
-                        attempt=1,
-                    )
-                    if call.is_schema_error:
-                        counters["schema_errors"] += 1
-                        raise ValueError(f"schema_error {call.error_message}")
-                    if call.error_message:
-                        _warn_non_schema(counters, phase="evaluator", rule_key=rule.key, error=call.error_message)
-                        continue
-                    if not isinstance(call.parsed, EvaluatorResult):
-                        counters["schema_errors"] += 1
-                        raise ValueError("schema_error evaluator payload type mismatch")
-
-                    call.parsed = normalize_evidence_span(call.parsed, text=message_text)
-                    err = evidence_error(call.parsed, message_id=message_id, text=message_text)
-                    if err:
-                        retry = llm.call_json_schema(
-                            conn,
-                            run_id=run_id,
-                            phase="evaluator",
-                            rule_key=rule.key,
-                            conversation_id=conversation_id,
-                            message_id=message_id,
-                            model_type=EvaluatorResult,
-                            system_prompt=sys_prompt,
-                            user_prompt=f"{user_prompt}\n\n{build_evidence_correction_note(message_id)}",
-                            attempt=2,
-                        )
-                        if retry.is_schema_error:
-                            counters["schema_errors"] += 1
-                            raise ValueError(f"schema_error {retry.error_message}")
-                        if retry.error_message:
-                            _warn_non_schema(counters, phase="evaluator", rule_key=rule.key, error=retry.error_message)
-                            continue
-                        if not isinstance(retry.parsed, EvaluatorResult):
-                            counters["schema_errors"] += 1
-                            raise ValueError("schema_error evaluator retry payload type mismatch")
-
-                        retry.parsed = normalize_evidence_span(retry.parsed, text=message_text)
-                        err = evidence_error(retry.parsed, message_id=message_id, text=message_text)
-                        if err:
-                            counters["evidence_mismatch_skipped"] += 1
-                            _warn_non_schema(
-                                counters,
-                                phase="evaluator",
-                                rule_key=rule.key,
-                                error=f"evidence_integrity_failed_after_retry: {err}",
-                            )
-                            continue
-                        call = retry
-
-                    evaluator_cache[(conversation_id, message_id, rule.key)] = call.parsed
+                    eval_result = eval_by_rule[rule.key]
+                    judge_result = judge_by_rule[rule.key]
                     conn.execute(
                         """
                         INSERT INTO scan_results(
-                          run_id, conversation_id, message_id, rule_key,
-                          eval_hit, eval_confidence, eval_reason_code, eval_reason,
-                          evidence_quote, evidence_message_id, evidence_span_start, evidence_span_end,
+                          run_id, conversation_id, seller_message_id, customer_message_id, rule_key,
+                          eval_hit, eval_confidence, eval_reason_code, eval_reason, evidence_quote,
                           judge_expected_hit, judge_label, judge_confidence, judge_rationale,
                           created_at_utc, updated_at_utc
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             run_id,
                             conversation_id,
-                            message_id,
+                            seller_message_id,
+                            customer_message_id,
                             rule.key,
-                            1 if call.parsed.hit else 0,
-                            float(call.parsed.confidence),
-                            str(call.parsed.reason_code),
-                            call.parsed.reason,
-                            call.parsed.evidence.quote,
-                            int(call.parsed.evidence.message_id),
-                            int(call.parsed.evidence.span_start),
-                            int(call.parsed.evidence.span_end),
+                            1 if eval_result.hit else 0,
+                            float(eval_result.confidence),
+                            str(eval_result.reason_code),
+                            str(eval_result.reason),
+                            str(eval_result.evidence_quote),
+                            1 if judge_result.expected_hit else 0,
+                            1 if judge_result.label else 0,
+                            float(judge_result.confidence),
+                            str(judge_result.rationale),
                             now_utc(),
                             now_utc(),
                         ),
                     )
                     counters["inserted"] += 1
-        conn.commit()
-
-        judge_rows = conn.execute(
-            """
-            SELECT
-              sr.result_id, sr.conversation_id, sr.message_id, sr.rule_key,
-              sr.eval_hit, sr.eval_confidence, sr.eval_reason_code, sr.eval_reason,
-              sr.evidence_quote, sr.evidence_message_id, sr.evidence_span_start, sr.evidence_span_end,
-              m.speaker_label, m.text
-            FROM scan_results sr
-            JOIN messages m ON m.message_id = sr.message_id
-            WHERE sr.run_id=?
-            ORDER BY sr.result_id
-            """,
-            (run_id,),
-        ).fetchall()
-
-        by_rule = {rule.key: rule for rule in rules}
-        current_conv = ""
-        for row in judge_rows:
-            conversation_id = str(row["conversation_id"])
-            if conversation_id != current_conv:
-                current_conv = conversation_id
-                print(f"[scan] judge conversation {conv_pos[current_conv]}/{len(conversation_ids)} id={current_conv}")
-
-            message_id = int(row["message_id"])
-            rule_key = str(row["rule_key"])
-            eval_result = evaluator_cache.get((conversation_id, message_id, rule_key), _fallback_evaluator_result(row))
-            chat_context = context_by_message_id.get(message_id, f"[{row['speaker_label']}] {row['text']}")
-            sys_prompt, user_prompt = build_judge_prompts(
-                by_rule[rule_key],
-                speaker_label=str(row["speaker_label"]),
-                text=str(row["text"]),
-                chat_context=chat_context,
-                evaluator=eval_result,
-            )
-
-            call = llm.call_json_schema(
-                conn,
-                run_id=run_id,
-                phase="judge",
-                rule_key=rule_key,
-                conversation_id=conversation_id,
-                message_id=message_id,
-                model_type=JudgeResult,
-                system_prompt=sys_prompt,
-                user_prompt=user_prompt,
-            )
-            if call.is_schema_error:
-                counters["schema_errors"] += 1
-                raise ValueError(f"schema_error {call.error_message}")
-            if call.error_message:
-                _warn_non_schema(counters, phase="judge", rule_key=rule_key, error=call.error_message)
-                continue
-            if not isinstance(call.parsed, JudgeResult):
-                counters["schema_errors"] += 1
-                raise ValueError("schema_error judge payload type mismatch")
-
-            flags = judge_inconsistency_flags(evaluator_hit=eval_result.hit, judge=call.parsed)
-            if flags:
-                _warn_soft_flag(counters, rule_key=rule_key, message_id=message_id, flags=flags)
-
-            conn.execute(
-                """
-                UPDATE scan_results
-                SET judge_expected_hit=?, judge_label=?, judge_confidence=?, judge_rationale=?, updated_at_utc=?
-                WHERE result_id=?
-                """,
-                (
-                    1 if call.parsed.expected_hit else 0,
-                    1 if call.parsed.label else 0,
-                    float(call.parsed.confidence),
-                    call.parsed.rationale,
-                    now_utc(),
-                    int(row["result_id"]),
-                ),
-            )
-            counters["judged"] += 1
+                    counters["judged"] += 1
         conn.commit()
 
         _compute_metrics(conn, run_id=run_id)
+
+        if counters["inserted"] != counters["judged"]:
+            raise ValueError(
+                f"judge coverage must be 1.0 in fixed mode: inserted={counters['inserted']} judged={counters['judged']}"
+            )
 
         canonical_run_id = get_state(conn, "canonical_run_id")
         canonical_version = _run_metrics_version(conn, run_id=canonical_run_id)
@@ -480,15 +404,15 @@ def run_scan(
             canonical_run_id = run_id
 
         summary.update(counters)
+        summary["judge_coverage"] = _safe_div(float(counters["judged"]), float(counters["inserted"]))
         summary["canonical_run_id"] = canonical_run_id
         status = "success"
         print(
             "[scan] summary "
-            f"processed={counters['processed']} inserted={counters['inserted']} judged={counters['judged']} "
-            f"skipped_due_to_errors={counters['skipped_due_to_errors']} "
-            f"evidence_mismatch_skipped={counters['evidence_mismatch_skipped']} "
-            f"judge_inconsistency_soft_flags={counters['judge_inconsistency_soft_flags']} "
-            f"schema_errors={counters['schema_errors']}"
+            f"seller_turns={counters['seller_turns']} processed={counters['processed']} "
+            f"inserted={counters['inserted']} judged={counters['judged']} "
+            f"judge_coverage={summary['judge_coverage']:.4f} "
+            f"schema_errors={counters['schema_errors']} non_schema_errors={counters['non_schema_errors']}"
         )
         return run_id
     except Exception as exc:
@@ -625,7 +549,8 @@ def _bad_cases(conn: sqlite3.Connection, *, run_id: str, limit: int = 20) -> lis
         """
         SELECT
           sr.conversation_id,
-          sr.message_id,
+          sr.seller_message_id,
+          sr.customer_message_id,
           sr.rule_key,
           sr.eval_hit,
           sr.judge_expected_hit,
@@ -635,11 +560,13 @@ def _bad_cases(conn: sqlite3.Connection, *, run_id: str, limit: int = 20) -> lis
           sr.evidence_quote,
           sr.eval_confidence,
           sr.judge_confidence,
-          m.text
+          seller.text AS seller_text,
+          COALESCE(customer.text, '') AS customer_text
         FROM scan_results sr
-        JOIN messages m ON m.message_id = sr.message_id
+        JOIN messages seller ON seller.message_id = sr.seller_message_id
+        LEFT JOIN messages customer ON customer.message_id = sr.customer_message_id
         WHERE sr.run_id=? AND sr.judge_label=0
-        ORDER BY ABS(sr.eval_confidence - COALESCE(sr.judge_confidence, 0)) DESC, sr.rule_key, sr.message_id
+        ORDER BY ABS(sr.eval_confidence - COALESCE(sr.judge_confidence, 0)) DESC, sr.rule_key, sr.seller_message_id
         LIMIT ?
         """,
         (run_id, int(limit)),
@@ -647,7 +574,10 @@ def _bad_cases(conn: sqlite3.Connection, *, run_id: str, limit: int = 20) -> lis
     return [
         {
             "conversation_id": str(row["conversation_id"]),
-            "message_id": int(row["message_id"]),
+            "seller_message_id": int(row["seller_message_id"]),
+            "customer_message_id": None
+            if row["customer_message_id"] is None
+            else int(row["customer_message_id"]),
             "rule_key": str(row["rule_key"]),
             "eval_hit": int(row["eval_hit"]),
             "judge_expected_hit": None
@@ -659,7 +589,8 @@ def _bad_cases(conn: sqlite3.Connection, *, run_id: str, limit: int = 20) -> lis
             "evidence_quote": str(row["evidence_quote"]),
             "eval_confidence": float(row["eval_confidence"]),
             "judge_confidence": None if row["judge_confidence"] is None else float(row["judge_confidence"]),
-            "text": str(row["text"]),
+            "seller_text": str(row["seller_text"]),
+            "customer_text": str(row["customer_text"]),
         }
         for row in rows
     ]
@@ -694,10 +625,9 @@ def build_report(
         metrics_version=metrics_version,
     )
 
+    rule_keys = [rule.key for rule in all_rules()]
     current = _accuracy_map(conn, run_id=run_id)
     canonical = _accuracy_map(conn, run_id=canonical_run_id)
-    rule_keys = [rule.key for rule in all_rules()]
-
     heatmap = _build_accuracy_heatmap_data(conn, run_id=run_id, rule_keys=rule_keys)
     conversation_ids = [str(value) for value in heatmap["conversation_ids"]]
     scores = heatmap["scores"]
@@ -711,22 +641,35 @@ def build_report(
     )
     bad_cases = _bad_cases(conn, run_id=run_id, limit=20)
 
-    run_summary = conn.execute(
+    run_summary_row = conn.execute(
         "SELECT summary_json FROM scan_runs WHERE run_id=?",
         (run_id,),
     ).fetchone()
-    inserted = int(
-        conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0]
-    )
+    inserted = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
     judged = int(
-        conn.execute(
-            "SELECT COUNT(*) FROM scan_results WHERE run_id=? AND judge_label IS NOT NULL",
-            (run_id,),
-        ).fetchone()[0]
+        conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=? AND judge_label IS NOT NULL", (run_id,)).fetchone()[0]
     )
+    coverage = _safe_div(float(judged), float(inserted))
+
+    metrics_rows = conn.execute(
+        """
+        SELECT rule_key, eval_total, eval_true, evaluator_hit_rate, judge_correctness, judge_coverage,
+               judged_total, judge_true, judge_false
+        FROM scan_metrics
+        WHERE run_id=?
+        ORDER BY rule_key
+        """,
+        (run_id,),
+    ).fetchall()
+
     llm_rows = conn.execute(
         """
-        SELECT phase, COUNT(*) AS calls, SUM(CASE WHEN error_message<>'' THEN 1 ELSE 0 END) AS errors
+        SELECT
+          phase,
+          COUNT(*) AS calls,
+          SUM(CASE WHEN error_message<>'' THEN 1 ELSE 0 END) AS errors,
+          SUM(prompt_chars) AS prompt_chars,
+          SUM(response_chars) AS response_chars
         FROM llm_calls
         WHERE run_id=?
         GROUP BY phase
@@ -741,18 +684,39 @@ def build_report(
         "# SGR Scan Metrics",
         "",
         f"- metrics_version: `{metrics_version}`",
+        "- scan_policy: `bundled=true, judge=full, context=full, llm_trace=full`",
+        "- llm_audit_trace: `full request_json + response_json + extracted_json`",
         f"- canonical_run_id: `{canonical_run_id}`",
         f"- current_run_id: `{run_id}`",
         f"- inserted_results: `{inserted}`",
         f"- judged_results: `{judged}`",
-        f"- judge_coverage: `{_safe_div(float(judged), float(inserted)):.4f}`",
+        f"- judge_coverage: `{coverage:.4f}`",
+        f"- judge_coverage_target: `{cfg.judge_coverage_min:.2f}`",
         "",
-        "## Rule Quality (judge_correctness)",
+        "## Rule Metrics",
         "",
-        "| rule | canonical | current | delta |",
-        "|---|---:|---:|---:|",
+        "| rule | eval_total | eval_true | evaluator_hit_rate | judge_correctness | judge_coverage |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
+    if metrics_rows:
+        for row in metrics_rows:
+            lines.append(
+                f"| `{row['rule_key']}` | {int(row['eval_total'])} | {int(row['eval_true'])} | "
+                f"{float(row['evaluator_hit_rate']):.4f} | {float(row['judge_correctness']):.4f} | "
+                f"{float(row['judge_coverage']):.4f} |"
+            )
+    else:
+        lines.append("| `-` | 0 | 0 | 0.0000 | 0.0000 | 0.0000 |")
 
+    lines.extend(
+        [
+            "",
+            "## Rule Quality Delta (judge_correctness)",
+            "",
+            "| rule | canonical | current | delta |",
+            "|---|---:|---:|---:|",
+        ]
+    )
     for key in rule_keys:
         can = canonical.get(key, 0.0)
         cur = current.get(key, 0.0)
@@ -766,17 +730,20 @@ def build_report(
     lines.extend(
         [
             "",
-            "## LLM Calls (full trace persisted in `llm_calls`)",
+            "## LLM Calls",
             "",
-            "| phase | calls | errors |",
-            "|---|---:|---:|",
+            "| phase | calls | errors | prompt_chars | response_chars |",
+            "|---|---:|---:|---:|---:|",
         ]
     )
     if llm_rows:
         for row in llm_rows:
-            lines.append(f"| `{row['phase']}` | {int(row['calls'])} | {int(row['errors'] or 0)} |")
+            lines.append(
+                f"| `{row['phase']}` | {int(row['calls'])} | {int(row['errors'] or 0)} | "
+                f"{int(row['prompt_chars'] or 0)} | {int(row['response_chars'] or 0)} |"
+            )
     else:
-        lines.append("| `-` | 0 | 0 |")
+        lines.append("| `-` | 0 | 0 | 0 | 0 |")
 
     lines.extend(
         [
@@ -814,15 +781,14 @@ def build_report(
             "",
             "## Judge-Confirmed Bad Cases (judge_label=0)",
             "",
-            "| conversation_id | message_id | rule | eval_hit | expected_hit | reason_code | evidence_quote |",
+            "| conversation_id | seller_message_id | rule | eval_hit | expected_hit | reason_code | evidence_quote |",
             "|---|---:|---|---:|---:|---|---|",
         ]
     )
-
     if bad_cases:
         for case in bad_cases:
             lines.append(
-                f"| `{case['conversation_id']}` | {case['message_id']} | `{case['rule_key']}` | "
+                f"| `{case['conversation_id']}` | {case['seller_message_id']} | `{case['rule_key']}` | "
                 f"{case['eval_hit']} | {case['judge_expected_hit']} | `{_md_cell(str(case['eval_reason_code']), 60)}` | "
                 f"`{_md_cell(str(case['evidence_quote']), 80)}` |"
             )
@@ -830,18 +796,19 @@ def build_report(
         lines.extend(["", "### Bad Case Details", ""])
         for idx, case in enumerate(bad_cases[:10], start=1):
             lines.append(
-                f"{idx}. `{case['conversation_id']}` msg={case['message_id']} rule=`{case['rule_key']}` "
-                f"eval_hit={case['eval_hit']} expected_hit={case['judge_expected_hit']}"
+                f"{idx}. `{case['conversation_id']}` seller_msg={case['seller_message_id']} "
+                f"rule=`{case['rule_key']}` eval_hit={case['eval_hit']} expected_hit={case['judge_expected_hit']}"
             )
-            lines.append(f"   text: {_md_cell(str(case['text']), 200)}")
+            lines.append(f"   customer_text: {_md_cell(str(case['customer_text']), 200)}")
+            lines.append(f"   seller_text: {_md_cell(str(case['seller_text']), 200)}")
             lines.append(f"   evaluator_reason: {_md_cell(str(case['eval_reason']), 200)}")
             lines.append(f"   judge_rationale: {_md_cell(str(case['judge_rationale']), 200)}")
             lines.append(f"   evidence_quote: {_md_cell(str(case['evidence_quote']), 120)}")
     else:
         lines.append("| `-` | 0 | `-` | 0 | 0 | `-` | `-` |")
 
-    if run_summary is not None:
-        lines.extend(["", "## Run Summary JSON", "", f"- summary_json: `{str(run_summary['summary_json'])}`"])
+    if run_summary_row is not None:
+        lines.extend(["", "## Run Summary JSON", "", f"- summary_json: `{str(run_summary_row['summary_json'])}`"])
 
     Path(md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 

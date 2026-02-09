@@ -5,6 +5,7 @@ src/dialogs/__main__.py
 src/dialogs/cli.py
 src/dialogs/db.py
 src/dialogs/demo.py
+src/dialogs/docs_refresh.py
 src/dialogs/eval.py
 src/dialogs/ingest.py
 src/dialogs/llm.py

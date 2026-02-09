@@ -1,70 +1,31 @@
-# dialogs-sgr
+# Платформа для контроля качества продажных переписок.
 
-SGR-платформа для оценки качества диалогов продаж с прозрачной логикой:
-- `evaluator` проверяет правила качества по каждому сообщению продавца;
-- `judge` независимо подтверждает, корректна ли оценка evaluator;
-- SQLite хранит полный аудит: результаты, метрики и трассировку вызовов LLM.
+Основной бизнес-эффект: рост `retention` за счет стабильного качества ответов продавца в каждом клиентском диалоге.
 
-## Для C-Level за 2 минуты
+## Про Value за 2 минуты
 
-Что измеряем:
-- `greeting`: продавец начал с явного приветствия.
-- `upsell`: есть уместное предложение следующего платного шага.
-- `empathy`: в контексте есть явное признание состояния клиента.
+Что система проверяет в каждой реплике продавца:
+- `greeting`: есть ли корректное приветствие;
+- `upsell`: предложен ли уместный следующий платный шаг;
+- `empathy`: признана ли ситуация клиента перед решением.
 
-Зачем это бизнесу:
-- стабильное качество коммуникации в масштабировании команды продаж;
-- рост конверсии и среднего чека без потери доверия клиента;
-- раннее выявление слабых сценариев и точечные рекомендации команде.
+Что гарантирует надежность:
 
-Как читать зоны качества:
-- `green` (`>= 0.90`): системно хорошо, можно тиражировать паттерн.
-- `yellow` (`>= 0.80` и `< 0.90`): приемлемо, но есть риск деградации.
-- `red` (`< 0.80`): приоритет на корректирующие действия.
+- каждая оцениваемая реплика проходит через две системы оценки `evaluator` и `judge`;
+- по каждому правилу мы можем посчитать вероятность его срабатывания;
+- Cохраняется полный аудит LLM-вызовов. Мы можем оценивать и удачные и ошибочные шаги. 
 
-## Как открыть executive-ноутбук
+## Порядок исполнения
 
-1. Подготовить окружение и данные:
-```bash
-make setup
-make init-fresh
-export OPENAI_API_KEY=...
-make scan
-```
-2. Запустить Jupyter:
-```bash
-make notebook
-```
-3. Открыть `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/notebooks/sgr_quality_demo.ipynb`.
-4. Выбрать kernel `Python (dialogs-sgr)`.
+Сканирование работает в одном фиксированном режиме:
+- bundled-оценка: один вызов evaluator и один вызов judge на реплику продавца;
+- full context: оценка опирается на полный контекст диалога до текущего шага;
+- full judge coverage: judge обязателен для каждой оцениваемой реплики;
+- full LLM audit trace: полный payload и ответ сохраняются всегда.
 
-Важно:
-- если видите `ModuleNotFoundError` (`pydantic`, `pandas`, `openai`), выбран неверный kernel;
-- executive-блоки ноутбука показывают бизнес-поля без перегруза техническими ID;
-- негативные кейсы строятся только по последнему успешному run (`latest_run`).
+Этот порядок не настраивается.
 
-## Как интерпретировать хорошие и негативные кейсы
-
-Хорошие кейсы:
-- фильтр: `final_score_for_message >= 0.90` и `judge_label = 1`;
-- смысл: сообщение стабильно проходит правила и подтверждено judge.
-
-Негативные кейсы:
-- фильтр: `judge_label = 0` в последнем успешном run;
-- смысл: evaluator ошибся относительно независимого ожидания judge;
-- действие: используйте поле рекомендаций в ноутбуке для понятных бизнес-улучшений.
-
-## Надежность и аудит
-
-- Structured outputs: evaluator/judge отвечают по строгим pydantic-схемам.
-- Evidence integrity: каждая положительная оценка привязана к дословной цитате и span.
-- Full trace: таблица `llm_calls` хранит `request_json`, `response_json`, parse/validation flags, latency.
-- Soft flags: для judge есть маркеры противоречивой rationale без остановки пайплайна.
-
-Ключевая логика и пороги централизованы в:
-- `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/src/dialogs/sgr_core.py`
-
-## Короткий Technical Quickstart
+## Быстрый Запуск
 
 ```bash
 make setup
@@ -72,28 +33,36 @@ make init-fresh
 export OPENAI_API_KEY=...
 make scan
 make report
-make test
 ```
 
-Полезные артефакты:
-- Markdown-отчет: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/artifacts/metrics.md`
-- Визуальный diff: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/artifacts/accuracy_diff.png`
-- Executive notebook: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/notebooks/sgr_quality_demo.ipynb`
+Открыть executive-ноутбук:
 
-## Ограничения и корректная интерпретация
+```bash
+make notebook
+```
 
-- Текущая версия намеренно ограничена тремя правилами: `greeting`, `upsell`, `empathy`.
-- Метрика `judge_correctness` оценивает корректность evaluator, а не напрямую бизнес-результат сделки.
-- Малое число негативов в latest run означает стабильность на выбранной выборке, но не отменяет мониторинг.
-- Любое изменение порогов/правил в `sgr_core.py` является продуктовым решением и должно фиксироваться явно.
+Kernel: `Python (dialogs-sgr)`.
 
-## Глоссарий RU + EN
+## Ключевые Артефакты
 
-- `judge_correctness`: доля корректных решений evaluator (Evaluator correctness rate).
-- `judge_label`: judge подтвердил evaluator (`1`) или опроверг (`0`) (Judge verdict).
-- `judge_expected_hit`: каким judge считает правильный hit (Judge expected hit).
-- `eval_hit`: бинарное решение evaluator по правилу (Evaluator hit decision).
-- `eval_reason`: объяснение evaluator на русском (Evaluator rationale).
-- `judge_rationale`: объяснение judge на русском (Judge rationale).
-- `evidence_quote`: дословная цитата-основание (Evidence quote).
-- `final_score_for_message`: средняя доля подтвержденных правил по сообщению (Final message quality score).
+- Executive notebook: [`notebooks/sgr_quality_demo.ipynb`](notebooks/sgr_quality_demo.ipynb)
+- Метрики: [`artifacts/metrics.md`](artifacts/metrics.md)
+- Heatmap: [`artifacts/accuracy_diff.png`](artifacts/accuracy_diff.png)
+
+## Точки Входа Документации (Doc-Contract)
+
+После любого продуктового изменения синхронно обновляются:
+1. [`README.md`](README.md)
+2. [`src/dialogs/sgr_core.py`](src/dialogs/sgr_core.py)
+3. [`tests/test_platform_dataset_style.py`](tests/test_platform_dataset_style.py)
+4. [`notebooks/sgr_quality_demo.ipynb`](notebooks/sgr_quality_demo.ipynb)
+5. [`artifacts/metrics.md`](artifacts/metrics.md)
+6. [`artifacts/accuracy_diff.png`](artifacts/accuracy_diff.png)
+7. [`Makefile`](Makefile)
+8. [`docs/stability_case_review.md`](docs/stability_case_review.md)
+
+## Глоссарий Метрик
+
+- `evaluator_hit_rate`: доля `eval_hit=1`.
+- `judge_correctness`: доля `judge_label=1` среди проверенных judge кейсов.
+- `judge_coverage`: доля проверенных judge кейсов среди всех eval-кейсов.

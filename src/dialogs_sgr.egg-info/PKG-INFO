@@ -15,26 +15,78 @@ Requires-Dist: pandas>=2.2.0; extra == "dev"
 
 # dialogs-sgr
 
-Минимальный SGR-сканер для 3 hardcoded правил (`greeting`, `upsell`, `empathy`) с SQLite, evaluator и `llm as judge`.
+SGR-платформа для контроля качества продажных переписок.
 
-## Quickstart (с нуля, единый Python setup)
+Основной бизнес-эффект: рост `retention` за счет стабильного качества ответов продавца в каждом клиентском диалоге.
+
+## Для C-Level за 2 минуты
+
+Что система проверяет в каждой реплике продавца:
+- `greeting`: есть ли корректное приветствие;
+- `upsell`: предложен ли уместный следующий платный шаг;
+- `empathy`: признана ли ситуация клиента перед решением.
+
+Что гарантирует надежность:
+- каждая оцениваемая реплика проходит через `evaluator` и `judge`;
+- `judge_coverage` в продукте зафиксирован как `1.0`;
+- по каждому правилу считаются `evaluator_hit_rate`, `judge_correctness`, `judge_coverage`;
+- в БД сохраняется полный аудит LLM-вызовов (`request_json`, `response_json`, `extracted_json`).
+
+## Неподвижный Контракт Исполнения
+
+Сканирование работает в одном фиксированном режиме:
+- bundled-оценка: один вызов evaluator и один вызов judge на реплику продавца;
+- full context: оценка опирается на полный контекст диалога до текущего шага;
+- full judge coverage: judge обязателен для каждой оцениваемой реплики;
+- full LLM audit trace: полный payload и ответ сохраняются всегда.
+
+Этот контракт не настраивается пользовательскими флагами scan.
+
+## Точки Входа Документации (Doc-Contract)
+
+После любого продуктового изменения синхронно обновляются:
+1. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/README.md`
+2. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/src/dialogs/sgr_core.py`
+3. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/tests/test_platform_dataset_style.py`
+4. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/notebooks/sgr_quality_demo.ipynb`
+5. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/artifacts/metrics.md`
+6. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/artifacts/accuracy_diff.png`
+7. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/Makefile`
+8. `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/docs/stability_case_review.md`
+
+## Быстрый Запуск
+
 ```bash
 make setup
 make init-fresh
+export OPENAI_API_KEY=...
 make scan
 make report
 make test
 ```
 
-Для ноутбука:
+Открыть executive-ноутбук:
+
 ```bash
 make notebook
 ```
-и в Jupyter выбрать kernel `Python (dialogs-sgr)`.
 
-Если в ноутбуке `ModuleNotFoundError` (`pydantic`, `pandas`, `openai`), значит выбран не kernel `Python (dialogs-sgr)`.
+Kernel: `Python (dialogs-sgr)`.
 
-## Что важно
-- Все `make`-команды работают через `.venv/bin/python` (без `source .venv/bin/activate`).
-- Базовая метрика качества: `judge_correctness` (`judge_label=1` означает корректность evaluator).
-- Пороги качества централизованы в `src/dialogs/sgr_core.py` (Balanced): `green>=0.90`, `yellow>=0.80`, `red<0.80`.
+## Ключевые Артефакты
+
+- Executive notebook: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/notebooks/sgr_quality_demo.ipynb`
+- Метрики: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/artifacts/metrics.md`
+- Heatmap: `/Users/ablackman/go/src/github.com/tetraminz/sales_protocol/artifacts/accuracy_diff.png`
+
+## Глоссарий Метрик
+
+- `evaluator_hit_rate`: доля `eval_hit=1`.
+- `judge_correctness`: доля `judge_label=1` среди проверенных judge кейсов.
+- `judge_coverage`: доля проверенных judge кейсов среди всех eval-кейсов.
+
+## Ограничения И Интерпретация
+
+- Система целенаправленно зафиксирована на трех правилах: `greeting`, `upsell`, `empathy`.
+- Схема v4+ не предназначена для автоматической миграции старых run-данных.
+- Полный LLM trace увеличивает объем БД, но нужен для аудита и управляемости на C-level.

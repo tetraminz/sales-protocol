@@ -2,58 +2,93 @@ from __future__ import annotations
 
 import pytest
 
-from dialogs.models import Evidence, EvaluatorResult, JudgeResult
+from dialogs.models import BundledEvaluatorResult, BundledJudgeResult, RuleEvaluation, RuleJudgeEvaluation
 
-STRICT_SCHEMA_CASES = [Evidence, EvaluatorResult, JudgeResult]
+STRICT_SCHEMA_CASES = [RuleEvaluation, BundledEvaluatorResult, RuleJudgeEvaluation, BundledJudgeResult]
 
 
 PARSER_CASES = [
     (
-        EvaluatorResult,
+        BundledEvaluatorResult,
         {
-            "hit": True,
-            "confidence": 0.8,
-            "evidence": {"quote": "Здравствуйте", "message_id": 1, "span_start": 0, "span_end": 11},
-            "reason_code": "greeting_present",
-            "reason": "Есть приветствие",
+            "greeting": {
+                "hit": True,
+                "confidence": 0.8,
+                "reason_code": "greeting_present",
+                "reason": "Есть приветствие",
+                "evidence_quote": "Здравствуйте",
+            },
+            "upsell": {
+                "hit": False,
+                "confidence": 0.7,
+                "reason_code": "upsell_missing",
+                "reason": "Нет следующего шага",
+                "evidence_quote": "",
+            },
+            "empathy": {
+                "hit": True,
+                "confidence": 0.9,
+                "reason_code": "empathy_acknowledged",
+                "reason": "Есть признание ситуации",
+                "evidence_quote": "Понимаю",
+            },
         },
         False,
     ),
     (
-        EvaluatorResult,
+        BundledEvaluatorResult,
         {
-            "hit": True,
-            "confidence": 1.2,
-            "evidence": {"quote": "Здравствуйте", "message_id": 1, "span_start": 0, "span_end": 11},
-            "reason_code": "greeting_present",
-            "reason": "Некорректная confidence",
+            "greeting": {
+                "hit": True,
+                "confidence": 1.2,
+                "reason_code": "greeting_present",
+                "reason": "Некорректная confidence",
+                "evidence_quote": "Здравствуйте",
+            },
+            "upsell": {
+                "hit": False,
+                "confidence": 0.7,
+                "reason_code": "upsell_missing",
+                "reason": "Нет следующего шага",
+                "evidence_quote": "",
+            },
+            "empathy": {
+                "hit": True,
+                "confidence": 0.9,
+                "reason_code": "empathy_acknowledged",
+                "reason": "Есть признание ситуации",
+                "evidence_quote": "Понимаю",
+            },
         },
         True,
     ),
     (
-        EvaluatorResult,
+        RuleEvaluation,
         {
-            "hit": False,
-            "confidence": 0.2,
-            "evidence": {"quote": "", "message_id": 1, "span_start": 0, "span_end": 0},
+            "hit": True,
+            "confidence": 0.9,
             "reason_code": "invalid_code",
-            "reason": "Неверный code",
+            "reason": "Неверный код",
+            "evidence_quote": "Здравствуйте",
         },
         True,
     ),
     (
-        Evidence,
-        {"quote": "abc", "message_id": 1, "span_start": 3, "span_end": 2},
-        True,
-    ),
-    (
-        JudgeResult,
-        {"expected_hit": True, "label": True, "confidence": 0.9, "rationale": "ok"},
+        BundledJudgeResult,
+        {
+            "greeting": {"expected_hit": True, "label": True, "confidence": 0.9, "rationale": "ok"},
+            "upsell": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
+            "empathy": {"expected_hit": True, "label": True, "confidence": 0.8, "rationale": "ok"},
+        },
         False,
     ),
     (
-        JudgeResult,
-        {"expected_hit": True, "label": True, "confidence": 0.9},
+        BundledJudgeResult,
+        {
+            "greeting": {"expected_hit": True, "label": True, "confidence": 0.9},
+            "upsell": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
+            "empathy": {"expected_hit": True, "label": True, "confidence": 0.8, "rationale": "ok"},
+        },
         True,
     ),
 ]
