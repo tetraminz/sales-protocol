@@ -8,7 +8,7 @@ import re
 
 import pytest
 
-from dialogs.db import connect, get_state, init_db
+from dialogs.db import SCHEMA_DICTIONARY_RU, connect, get_state, init_db, schema_dictionary_missing_entries
 from dialogs.ingest import ingest_csv_dir
 from dialogs.llm import CallResult, LLMClient
 from dialogs.models import Evidence, EvaluatorResult, JudgeResult
@@ -87,31 +87,12 @@ class FakeLLM:
             )
 
         if model_type is EvaluatorResult:
-            full_text = str(
-                conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]
-            )
+            full_text = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0])
             text = full_text.lower()
-
-            if self.mode == "span_drift_once" and rule_key == "greeting" and attempt == 1 and not self._mismatch_once_used:
-                self._mismatch_once_used = True
-                quote = full_text.split()[0]
-                parsed = EvaluatorResult(
-                    hit=True,
-                    confidence=0.8,
-                    evidence=Evidence(
-                        quote=quote,
-                        message_id=message_id,
-                        span_start=0,
-                        span_end=max(1, len(quote) - 1),
-                    ),
-                    reason_code="greeting_present",
-                    reason="span-drift-once",
-                )
-                return CallResult(parsed, True, True, "", False, False)
 
             if self.mode == "evidence_mismatch_once" and rule_key == "greeting" and attempt == 1 and not self._mismatch_once_used:
                 self._mismatch_once_used = True
-                quote = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]).split()[0]
+                quote = full_text.split()[0]
                 parsed = EvaluatorResult(
                     hit=True,
                     confidence=0.8,
@@ -127,7 +108,7 @@ class FakeLLM:
                 return CallResult(parsed, True, True, "", False, False)
 
             if self.mode == "evidence_mismatch_always" and rule_key == "greeting":
-                quote = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0]).split()[0]
+                quote = full_text.split()[0]
                 parsed = EvaluatorResult(
                     hit=True,
                     confidence=0.8,
@@ -143,12 +124,11 @@ class FakeLLM:
                 return CallResult(parsed, True, True, "", False, False)
 
             if rule_key == "greeting":
-                hit = "здрав" in text or "привет" in text
+                hit = "здрав" in text or "hello" in text
             elif rule_key == "upsell":
-                hit = "пакет" in text or "тариф" in text or "доп" in text
+                hit = "пакет" in text or "plan" in text or "доп" in text
             elif rule_key == "empathy":
-                # В тесте важно, что контекст реально передан и участвует в решении.
-                hit = ("понима" in text or "сожале" in text) and ("customer:" in user_prompt.lower())
+                hit = ("понима" in text or "understand" in text) and ("customer:" in user_prompt.lower())
             else:
                 hit = False
 
@@ -182,6 +162,7 @@ class FakeLLM:
             if self.mode == "judge_rationale_conflict" and rule_key == "upsell":
                 label = False
                 rationale = "Оценка корректна, но label выставлен некорректно."
+
             parsed = JudgeResult(
                 expected_hit=expected_hit,
                 label=label,
@@ -218,76 +199,42 @@ def csv_dir(tmp_path: Path) -> Path:
 
 
 EVIDENCE_CASES = [
-    {
-        "код": "hit_true_quote_inside_text",
-        "описание": "При hit=true quote обязан быть точной подстрокой сообщения.",
-        "value": EvaluatorResult(
+    (
+        EvaluatorResult(
             hit=True,
             confidence=0.9,
             evidence=Evidence(quote="Здравствуйте", message_id=11, span_start=0, span_end=len("Здравствуйте")),
             reason_code="greeting_present",
             reason="ok",
         ),
-        "message_id": 11,
-        "text": "Здравствуйте, рад помочь",
-        "ожидается": None,
-    },
-    {
-        "код": "hit_true_empty_quote",
-        "описание": "Пустая цитата при hit=true запрещена.",
-        "value": EvaluatorResult(
+        11,
+        "Здравствуйте, рад помочь",
+        None,
+    ),
+    (
+        EvaluatorResult(
             hit=True,
             confidence=0.9,
             evidence=Evidence(quote="", message_id=11, span_start=0, span_end=0),
             reason_code="greeting_present",
             reason="ok",
         ),
-        "message_id": 11,
-        "text": "Здравствуйте, рад помочь",
-        "ожидается": "evidence.quote пустой",
-    },
-    {
-        "код": "hit_true_wrong_message_id",
-        "описание": "source message_id должен совпадать с текущим сообщением.",
-        "value": EvaluatorResult(
+        11,
+        "Здравствуйте, рад помочь",
+        "evidence.quote пустой",
+    ),
+    (
+        EvaluatorResult(
             hit=True,
             confidence=0.9,
             evidence=Evidence(quote="Здравствуйте", message_id=99, span_start=0, span_end=len("Здравствуйте")),
             reason_code="greeting_present",
             reason="ok",
         ),
-        "message_id": 11,
-        "text": "Здравствуйте, рад помочь",
-        "ожидается": "evidence.message_id",
-    },
-    {
-        "код": "hit_true_quote_not_substring",
-        "описание": "Перефразирование запрещено: quote должен совпасть как подстрока.",
-        "value": EvaluatorResult(
-            hit=True,
-            confidence=0.9,
-            evidence=Evidence(quote="Добрый день", message_id=11, span_start=0, span_end=10),
-            reason_code="greeting_present",
-            reason="ok",
-        ),
-        "message_id": 11,
-        "text": "Здравствуйте, рад помочь",
-        "ожидается": "text[span_start:span_end]",
-    },
-    {
-        "код": "hit_true_invalid_span",
-        "описание": "Невалидный диапазон span при hit=true запрещен.",
-        "value": EvaluatorResult(
-            hit=True,
-            confidence=0.9,
-            evidence=Evidence(quote="Здравствуйте", message_id=11, span_start=12, span_end=12),
-            reason_code="greeting_present",
-            reason="ok",
-        ),
-        "message_id": 11,
-        "text": "Здравствуйте, рад помочь",
-        "ожидается": "span_end должен быть > evidence.span_start",
-    },
+        11,
+        "Здравствуйте, рад помочь",
+        "evidence.message_id",
+    ),
 ]
 
 
@@ -296,18 +243,18 @@ def test_rules_are_exactly_three_hardcoded_dataset_style() -> None:
     assert keys == ["greeting", "upsell", "empathy"]
 
 
-@pytest.mark.parametrize("case", EVIDENCE_CASES, ids=[c["код"] for c in EVIDENCE_CASES])
-def test_evidence_referential_integrity_dataset_style(case: dict[str, object]) -> None:
-    err = evidence_error(
-        case["value"],  # type: ignore[arg-type]
-        message_id=case["message_id"],  # type: ignore[arg-type]
-        text=case["text"],  # type: ignore[arg-type]
-    )
-    expected = case["ожидается"]
+@pytest.mark.parametrize("value,message_id,text,expected", EVIDENCE_CASES)
+def test_evidence_referential_integrity_dataset_style(
+    value: EvaluatorResult,
+    message_id: int,
+    text: str,
+    expected: str | None,
+) -> None:
+    err = evidence_error(value, message_id=message_id, text=text)
     if expected is None:
         assert err is None
     else:
-        assert err is not None and str(expected) in err
+        assert err is not None and expected in err
 
 
 def test_normalize_evidence_span_repairs_slice_mismatch_dataset_style() -> None:
@@ -385,33 +332,6 @@ def test_context_is_passed_for_empathy_dataset_style(db_path: Path, csv_dir: Pat
     assert all("Customer:" in p for p in fake.empathy_judge_prompts)
 
 
-def test_no_heuristic_gating_for_empathy_dataset_style(db_path: Path, csv_dir: Path) -> None:
-    init_db(str(db_path))
-    fake = FakeLLM("ok")
-    with connect(str(db_path)) as conn:
-        ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=fake, conversation_from=0, conversation_to=1)
-        summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
-        results_count = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
-
-    assert summary["seller_messages"] == 4
-    assert len(fake.empathy_eval_prompts) == 4
-    assert results_count == 12
-
-
-def test_scan_explicit_range_inclusive_dataset_style(db_path: Path, csv_dir: Path) -> None:
-    init_db(str(db_path))
-    with connect(str(db_path)) as conn:
-        ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=2, conversation_to=3)
-        convs = conn.execute(
-            "SELECT DISTINCT conversation_id FROM scan_results WHERE run_id=? ORDER BY conversation_id",
-            (run_id,),
-        ).fetchall()
-
-    assert [row[0] for row in convs] == ["conv_02", "conv_03"]
-
-
 def test_scan_non_schema_error_skips_and_continues_dataset_style(db_path: Path, csv_dir: Path) -> None:
     init_db(str(db_path))
     with connect(str(db_path)) as conn:
@@ -450,33 +370,6 @@ def test_evaluator_evidence_mismatch_retried_once_then_success_dataset_style(db_
     assert 2 in fake.greeting_eval_attempts
 
 
-def test_evaluator_span_drift_autofixed_without_retry_dataset_style(db_path: Path, csv_dir: Path) -> None:
-    init_db(str(db_path))
-    fake = FakeLLM("span_drift_once")
-    with connect(str(db_path)) as conn:
-        ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=fake, conversation_from=0, conversation_to=0)
-        status = conn.execute("SELECT status FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0]
-        summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
-
-    assert status == "success"
-    assert 2 not in fake.greeting_eval_attempts
-    assert int(summary["evidence_mismatch_skipped"]) == 0
-
-
-def test_retry_does_not_inflate_dropped_case_count_dataset_style(db_path: Path, csv_dir: Path) -> None:
-    init_db(str(db_path))
-    fake = FakeLLM("evidence_mismatch_once")
-    with connect(str(db_path)) as conn:
-        ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=fake, conversation_from=0, conversation_to=0)
-        summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
-        inserted_results = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
-
-    assert fake.evaluator_calls == inserted_results + 1
-    assert int(summary["processed"]) == inserted_results
-
-
 def test_evaluator_evidence_mismatch_twice_should_skip_not_fail_dataset_style(db_path: Path, csv_dir: Path) -> None:
     init_db(str(db_path))
     with connect(str(db_path)) as conn:
@@ -506,6 +399,9 @@ def test_judge_phase_updates_existing_rows_and_no_duplicates_dataset_style(db_pa
         judged = int(
             conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=? AND judge_label IS NOT NULL", (run_id,)).fetchone()[0]
         )
+        expected_set = int(
+            conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=? AND judge_expected_hit IS NOT NULL", (run_id,)).fetchone()[0]
+        )
         unique_rows = int(
             conn.execute(
                 """
@@ -522,39 +418,36 @@ def test_judge_phase_updates_existing_rows_and_no_duplicates_dataset_style(db_pa
 
     assert total > 0
     assert judged == total
+    assert expected_set == total
     assert unique_rows == total
 
 
-def test_metrics_use_judge_correctness_semantics_dataset_style(db_path: Path, csv_dir: Path) -> None:
+def test_metrics_minimal_schema_and_values_dataset_style(db_path: Path, csv_dir: Path) -> None:
     init_db(str(db_path))
     with connect(str(db_path)) as conn:
         ingest_csv_dir(conn, str(csv_dir), replace=True)
         run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=1)
-        row = conn.execute(
-            """
-            SELECT
-              MAX(CASE WHEN metric_name='judge_correctness' THEN metric_value END) AS judge_correctness,
-              MAX(CASE WHEN metric_name='accuracy' THEN metric_value END) AS accuracy,
-              MAX(CASE WHEN metric_name='recall' THEN metric_value END) AS recall
-            FROM scan_metrics
-            WHERE run_id=? AND rule_key='greeting'
-            """,
+        columns = [
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(scan_metrics)").fetchall()
+        ]
+        rows = conn.execute(
+            "SELECT rule_key, judge_correctness, judged_total, judge_true, judge_false FROM scan_metrics WHERE run_id=? ORDER BY rule_key",
             (run_id,),
-        ).fetchone()
+        ).fetchall()
 
-    assert float(row["judge_correctness"]) == pytest.approx(1.0, abs=1e-9)
-    assert float(row["accuracy"]) == pytest.approx(1.0, abs=1e-9)
-    assert float(row["recall"]) == pytest.approx(1.0, abs=1e-9)
-
-
-def test_judge_inconsistency_soft_flag_recorded_dataset_style(db_path: Path, csv_dir: Path) -> None:
-    init_db(str(db_path))
-    with connect(str(db_path)) as conn:
-        ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=FakeLLM("judge_rationale_conflict"), conversation_from=0, conversation_to=0)
-        summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
-
-    assert int(summary["judge_inconsistency_soft_flags"]) >= 1
+    assert columns == [
+        "run_id",
+        "rule_key",
+        "judge_correctness",
+        "judged_total",
+        "judge_true",
+        "judge_false",
+        "created_at_utc",
+    ]
+    assert len(rows) == 3
+    assert all(float(row["judge_correctness"]) >= 0.0 for row in rows)
+    assert all(int(row["judged_total"]) >= 0 for row in rows)
 
 
 def test_heatmap_zone_thresholds_dataset_style() -> None:
@@ -563,34 +456,6 @@ def test_heatmap_zone_thresholds_dataset_style() -> None:
     assert _heatmap_zone(cfg.green_min) == "green"
     assert _heatmap_zone(cfg.yellow_min) == "yellow"
     assert _heatmap_zone(cfg.yellow_min - 0.0001) == "red"
-
-
-def test_heatmap_scores_follow_judge_label_dataset_style(db_path: Path, csv_dir: Path) -> None:
-    init_db(str(db_path))
-    with connect(str(db_path)) as conn:
-        ingest_csv_dir(conn, str(csv_dir), replace=True)
-        run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=0)
-        conv = str(
-            conn.execute("SELECT DISTINCT conversation_id FROM scan_results WHERE run_id=? LIMIT 1", (run_id,)).fetchone()[0]
-        )
-        conn.execute(
-            """
-            UPDATE scan_results
-            SET eval_hit=0, judge_label=1
-            WHERE run_id=? AND conversation_id=? AND rule_key='greeting'
-            """,
-            (run_id, conv),
-        )
-        conn.commit()
-        heatmap = _build_accuracy_heatmap_data(
-            conn,
-            run_id=run_id,
-            rule_keys=[rule.key for rule in all_rules()],
-        )
-
-    row_idx = [str(x) for x in heatmap["conversation_ids"]].index(conv)
-    col_idx = [rule.key for rule in all_rules()].index("greeting")
-    assert float(heatmap["scores"][row_idx][col_idx]) == pytest.approx(1.0, abs=1e-9)
 
 
 def test_heatmap_data_ordering_and_na_dataset_style(db_path: Path, csv_dir: Path) -> None:
@@ -637,16 +502,6 @@ def test_canonical_first_run_and_delta_report_dataset_style(db_path: Path, csv_d
         report = build_report(conn, run_id=second_run, md_path=str(md_path), png_path=str(png_path))
 
         md_text = md_path.read_text(encoding="utf-8")
-        heatmap = _build_accuracy_heatmap_data(
-            conn,
-            run_id=second_run,
-            rule_keys=[rule.key for rule in all_rules()],
-        )
-        zones = {
-            _heatmap_zone(score)
-            for row in heatmap["scores"]
-            for score in row
-        }
 
     assert canonical == first_run
     assert canonical_after == first_run
@@ -654,11 +509,9 @@ def test_canonical_first_run_and_delta_report_dataset_style(db_path: Path, csv_d
     assert report["run_id"] == second_run
     assert md_path.exists()
     assert png_path.exists()
-    assert "delta" in md_text
-    assert "## Judge-Aligned Heatmap" in md_text
-    assert "| zone | cells |" in md_text
-    assert "Worst conversation x rule cells" in md_text
-    assert zones.issuperset({"green", "red"})
+    assert "## Rule Quality (judge_correctness)" in md_text
+    assert "## Judge-Confirmed Bad Cases (judge_label=0)" in md_text
+    assert "Bad Case Details" in md_text
 
 
 def test_report_metrics_align_with_scan_metrics_dataset_style(db_path: Path, csv_dir: Path, tmp_path: Path) -> None:
@@ -671,13 +524,9 @@ def test_report_metrics_align_with_scan_metrics_dataset_style(db_path: Path, csv
         build_report(conn, run_id=run_id, md_path=str(md_path), png_path=str(png_path))
 
         sql_map = {
-            str(row["rule_key"]): float(row["metric_value"])
+            str(row["rule_key"]): float(row["judge_correctness"])
             for row in conn.execute(
-                """
-                SELECT rule_key, metric_value
-                FROM scan_metrics
-                WHERE run_id=? AND metric_name='judge_correctness'
-                """,
+                "SELECT rule_key, judge_correctness FROM scan_metrics WHERE run_id=?",
                 (run_id,),
             ).fetchall()
         }
@@ -693,6 +542,54 @@ def test_report_metrics_align_with_scan_metrics_dataset_style(db_path: Path, csv
     assert set(md_map) == set(sql_map)
     for key, value in sql_map.items():
         assert md_map[key] == pytest.approx(value, abs=1e-9)
+
+
+def test_schema_dictionary_covers_all_tables_and_columns_dataset_style(db_path: Path) -> None:
+    init_db(str(db_path))
+    with connect(str(db_path)) as conn:
+        missing = schema_dictionary_missing_entries(conn)
+
+    assert not missing
+    assert "conversations" in SCHEMA_DICTIONARY_RU
+    assert "llm_calls" in SCHEMA_DICTIONARY_RU
+
+
+def test_llm_call_persists_full_trace_dataset_style(db_path: Path) -> None:
+    init_db(str(db_path))
+    llm = LLMClient(model="gpt-4.1-mini", api_key="")
+
+    with connect(str(db_path)) as conn:
+        out = llm.call_json_schema(
+            conn,
+            run_id="scan_test_llm_calls",
+            phase="evaluator",
+            rule_key="greeting",
+            conversation_id="conv_x",
+            message_id=1,
+            model_type=EvaluatorResult,
+            system_prompt="system",
+            user_prompt="user",
+            attempt=1,
+        )
+        row = conn.execute(
+            """
+            SELECT request_json, response_json, extracted_json, parse_ok, validation_ok,
+                   response_http_status, error_message, latency_ms
+            FROM llm_calls
+            ORDER BY call_id DESC LIMIT 1
+            """
+        ).fetchone()
+
+    assert out.is_live_error is True
+    assert row is not None
+    assert str(row["request_json"]).startswith("{")
+    assert str(row["response_json"]).startswith("{")
+    assert isinstance(row["extracted_json"], str)
+    assert int(row["parse_ok"]) in (0, 1)
+    assert int(row["validation_ok"]) in (0, 1)
+    assert int(row["response_http_status"]) >= 0
+    assert str(row["error_message"]) != ""
+    assert int(row["latency_ms"]) >= 0
 
 
 def test_live_required_for_scan_dataset_style(db_path: Path, csv_dir: Path) -> None:

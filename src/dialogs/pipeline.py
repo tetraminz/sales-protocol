@@ -7,7 +7,6 @@ from typing import Any
 
 from .db import get_state, set_state
 from .llm import LLMClient
-from .llm_as_judge import build_judge_prompts
 from .models import Evidence, EvaluatorResult, JudgeResult
 from .report_image import write_accuracy_diff_png
 from .sgr_core import (
@@ -16,6 +15,7 @@ from .sgr_core import (
     build_chat_context,
     build_evaluator_prompts,
     build_evidence_correction_note,
+    build_judge_prompts,
     default_reason_code,
     evidence_error,
     heatmap_zone,
@@ -43,7 +43,7 @@ def load_messages_for_range(
         raise ValueError(f"conversation_from={conversation_from} is out of range (total={total})")
 
     ids = [
-        row["conversation_id"]
+        str(row["conversation_id"])
         for row in conn.execute(
             "SELECT conversation_id FROM conversations ORDER BY conversation_id LIMIT ? OFFSET ?",
             (conversation_to - conversation_from + 1, conversation_from),
@@ -79,10 +79,7 @@ def _warn_non_schema(counters: dict[str, int], *, phase: str, rule_key: str, err
 def _warn_soft_flag(counters: dict[str, int], *, rule_key: str, message_id: int, flags: list[str]) -> None:
     counters["judge_inconsistency_soft_flags"] += 1
     if counters["judge_inconsistency_soft_flags"] <= 3:
-        print(
-            "[scan][soft-flag] "
-            f"rule={rule_key} msg={message_id} flags={','.join(flags)}"
-        )
+        print(f"[scan][soft-flag] rule={rule_key} msg={message_id} flags={','.join(flags)}")
     elif counters["judge_inconsistency_soft_flags"] == 4:
         print("[scan][soft-flag] additional judge inconsistencies suppressed")
 
@@ -155,17 +152,26 @@ def _span_from_quote(*, text: str, quote: str) -> tuple[int, int]:
 def _fallback_evaluator_result(row: sqlite3.Row) -> EvaluatorResult:
     text = str(row["text"])
     quote = str(row["evidence_quote"])
-    span_start, span_end = _span_from_quote(text=text, quote=quote)
+
+    span_start = row["evidence_span_start"]
+    span_end = row["evidence_span_end"]
+    if span_start is None or span_end is None:
+        span_start, span_end = _span_from_quote(text=text, quote=quote)
+
+    reason_code = str(row["eval_reason_code"] or "")
+    if not reason_code:
+        reason_code = default_reason_code(str(row["rule_key"]), hit=bool(row["eval_hit"]))
+
     return EvaluatorResult(
         hit=bool(row["eval_hit"]),
         confidence=float(row["eval_confidence"]),
         evidence=Evidence(
             quote=quote,
             message_id=int(row["evidence_message_id"]),
-            span_start=span_start,
-            span_end=span_end,
+            span_start=int(span_start),
+            span_end=int(span_end),
         ),
-        reason_code=default_reason_code(str(row["rule_key"]), hit=bool(row["eval_hit"])),
+        reason_code=reason_code,  # type: ignore[arg-type]
         reason=str(row["eval_reason"]),
     )
 
@@ -176,10 +182,6 @@ def _compute_metrics(conn: sqlite3.Connection, *, run_id: str) -> None:
         row = conn.execute(
             """
             SELECT
-              SUM(CASE WHEN eval_hit=1 AND judge_label=1 THEN 1 ELSE 0 END) AS tp,
-              SUM(CASE WHEN eval_hit=1 AND judge_label=0 THEN 1 ELSE 0 END) AS fp,
-              SUM(CASE WHEN eval_hit=0 AND judge_label=1 THEN 1 ELSE 0 END) AS tn,
-              SUM(CASE WHEN eval_hit=0 AND judge_label=0 THEN 1 ELSE 0 END) AS fn,
               SUM(CASE WHEN judge_label=1 THEN 1 ELSE 0 END) AS judge_true,
               SUM(CASE WHEN judge_label=0 THEN 1 ELSE 0 END) AS judge_false,
               SUM(CASE WHEN judge_label IS NOT NULL THEN 1 ELSE 0 END) AS judged_total
@@ -189,37 +191,27 @@ def _compute_metrics(conn: sqlite3.Connection, *, run_id: str) -> None:
             (run_id, rule.key),
         ).fetchone()
 
-        tp = float(row["tp"] or 0)
-        fp = float(row["fp"] or 0)
-        tn = float(row["tn"] or 0)
-        fn = float(row["fn"] or 0)
-        judge_true = float(row["judge_true"] or 0)
-        judge_false = float(row["judge_false"] or 0)
-        total = float(row["judged_total"] or 0)
+        judge_true = int(row["judge_true"] or 0)
+        judge_false = int(row["judge_false"] or 0)
+        judged_total = int(row["judged_total"] or 0)
+        judge_correctness = _safe_div(float(judge_true), float(judged_total))
 
-        precision = _safe_div(tp, tp + fp)
-        recall = _safe_div(tp, tp + fn)
-        judge_correctness = _safe_div(judge_true, total)
-        metrics = {
-            "judge_correctness": judge_correctness,
-            "accuracy": judge_correctness,
-            "precision": precision,
-            "recall": recall,
-            "f1": _safe_div(2 * precision * recall, precision + recall),
-            "coverage": _safe_div(tp + fp, total),
-            "tp": tp,
-            "fp": fp,
-            "tn": tn,
-            "fn": fn,
-            "judge_true": judge_true,
-            "judge_false": judge_false,
-            "total": total,
-        }
-        for metric_name, metric_value in metrics.items():
-            conn.execute(
-                "INSERT INTO scan_metrics(run_id, rule_key, metric_name, metric_value, created_at_utc) VALUES(?, ?, ?, ?, ?)",
-                (run_id, rule.key, metric_name, float(metric_value), now_utc()),
-            )
+        conn.execute(
+            """
+            INSERT INTO scan_metrics(
+              run_id, rule_key, judge_correctness, judged_total, judge_true, judge_false, created_at_utc
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                rule.key,
+                float(judge_correctness),
+                int(judged_total),
+                int(judge_true),
+                int(judge_false),
+                now_utc(),
+            ),
+        )
     conn.commit()
 
 
@@ -239,7 +231,7 @@ def run_scan(
     )
     by_conversation: dict[str, list[sqlite3.Row]] = {}
     for message in messages:
-        by_conversation.setdefault(message["conversation_id"], []).append(message)
+        by_conversation.setdefault(str(message["conversation_id"]), []).append(message)
 
     rules = all_rules()
     run_id = f"scan_{uuid.uuid4().hex[:12]}"
@@ -300,6 +292,7 @@ def run_scan(
                     current_message_order=int(message["message_order"]),
                 )
                 context_by_message_id[message_id] = chat_context
+
                 for rule in rules:
                     counters["processed"] += 1
                     sys_prompt, user_prompt = build_evaluator_prompts(
@@ -355,6 +348,7 @@ def run_scan(
                         if not isinstance(retry.parsed, EvaluatorResult):
                             counters["schema_errors"] += 1
                             raise ValueError("schema_error evaluator retry payload type mismatch")
+
                         retry.parsed = normalize_evidence_span(retry.parsed, text=message_text)
                         err = evidence_error(retry.parsed, message_id=message_id, text=message_text)
                         if err:
@@ -373,9 +367,11 @@ def run_scan(
                         """
                         INSERT INTO scan_results(
                           run_id, conversation_id, message_id, rule_key,
-                          eval_hit, eval_confidence, evidence_quote, evidence_message_id, eval_reason,
-                          judge_label, judge_confidence, judge_rationale, created_at_utc, updated_at_utc
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                          eval_hit, eval_confidence, eval_reason_code, eval_reason,
+                          evidence_quote, evidence_message_id, evidence_span_start, evidence_span_end,
+                          judge_expected_hit, judge_label, judge_confidence, judge_rationale,
+                          created_at_utc, updated_at_utc
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
                         """,
                         (
                             run_id,
@@ -384,9 +380,12 @@ def run_scan(
                             rule.key,
                             1 if call.parsed.hit else 0,
                             float(call.parsed.confidence),
+                            str(call.parsed.reason_code),
+                            call.parsed.reason,
                             call.parsed.evidence.quote,
                             int(call.parsed.evidence.message_id),
-                            call.parsed.reason,
+                            int(call.parsed.evidence.span_start),
+                            int(call.parsed.evidence.span_end),
                             now_utc(),
                             now_utc(),
                         ),
@@ -398,7 +397,8 @@ def run_scan(
             """
             SELECT
               sr.result_id, sr.conversation_id, sr.message_id, sr.rule_key,
-              sr.eval_hit, sr.eval_confidence, sr.evidence_quote, sr.evidence_message_id, sr.eval_reason,
+              sr.eval_hit, sr.eval_confidence, sr.eval_reason_code, sr.eval_reason,
+              sr.evidence_quote, sr.evidence_message_id, sr.evidence_span_start, sr.evidence_span_end,
               m.speaker_label, m.text
             FROM scan_results sr
             JOIN messages m ON m.message_id = sr.message_id
@@ -407,14 +407,15 @@ def run_scan(
             """,
             (run_id,),
         ).fetchall()
+
         by_rule = {rule.key: rule for rule in rules}
         current_conv = ""
         for row in judge_rows:
-            if row["conversation_id"] != current_conv:
-                current_conv = str(row["conversation_id"])
+            conversation_id = str(row["conversation_id"])
+            if conversation_id != current_conv:
+                current_conv = conversation_id
                 print(f"[scan] judge conversation {conv_pos[current_conv]}/{len(conversation_ids)} id={current_conv}")
 
-            conversation_id = str(row["conversation_id"])
             message_id = int(row["message_id"])
             rule_key = str(row["rule_key"])
             eval_result = evaluator_cache.get((conversation_id, message_id, rule_key), _fallback_evaluator_result(row))
@@ -426,6 +427,7 @@ def run_scan(
                 chat_context=chat_context,
                 evaluator=eval_result,
             )
+
             call = llm.call_json_schema(
                 conn,
                 run_id=run_id,
@@ -447,20 +449,18 @@ def run_scan(
                 counters["schema_errors"] += 1
                 raise ValueError("schema_error judge payload type mismatch")
 
-            flags = judge_inconsistency_flags(
-                evaluator_hit=eval_result.hit,
-                judge=call.parsed,
-            )
+            flags = judge_inconsistency_flags(evaluator_hit=eval_result.hit, judge=call.parsed)
             if flags:
                 _warn_soft_flag(counters, rule_key=rule_key, message_id=message_id, flags=flags)
 
             conn.execute(
                 """
                 UPDATE scan_results
-                SET judge_label=?, judge_confidence=?, judge_rationale=?, updated_at_utc=?
+                SET judge_expected_hit=?, judge_label=?, judge_confidence=?, judge_rationale=?, updated_at_utc=?
                 WHERE result_id=?
                 """,
                 (
+                    1 if call.parsed.expected_hit else 0,
                     1 if call.parsed.label else 0,
                     float(call.parsed.confidence),
                     call.parsed.rationale,
@@ -472,6 +472,7 @@ def run_scan(
         conn.commit()
 
         _compute_metrics(conn, run_id=run_id)
+
         canonical_run_id = get_state(conn, "canonical_run_id")
         canonical_version = _run_metrics_version(conn, run_id=canonical_run_id)
         if canonical_run_id is None or canonical_version != METRICS_VERSION:
@@ -500,15 +501,10 @@ def run_scan(
 
 def _accuracy_map(conn: sqlite3.Connection, *, run_id: str) -> dict[str, float]:
     rows = conn.execute(
-        "SELECT rule_key, metric_value FROM scan_metrics WHERE run_id=? AND metric_name='judge_correctness' ORDER BY rule_key",
+        "SELECT rule_key, judge_correctness FROM scan_metrics WHERE run_id=? ORDER BY rule_key",
         (run_id,),
     ).fetchall()
-    if not rows:
-        rows = conn.execute(
-            "SELECT rule_key, metric_value FROM scan_metrics WHERE run_id=? AND metric_name='accuracy' ORDER BY rule_key",
-            (run_id,),
-        ).fetchall()
-    return {str(row["rule_key"]): float(row["metric_value"]) for row in rows}
+    return {str(row["rule_key"]): float(row["judge_correctness"]) for row in rows}
 
 
 def _build_accuracy_heatmap_data(
@@ -553,6 +549,7 @@ def _build_accuracy_heatmap_data(
             row_scores.append(_safe_div(float(correct), float(judged)) if judged else None)
         scores.append(row_scores)
         judged_totals.append(row_judged)
+
     return {
         "conversation_ids": conversation_ids,
         "rule_keys": list(rule_keys),
@@ -623,6 +620,58 @@ def _canonical_run_for_version(
     return run_id, "canonical run fell back to current run due to metrics version mismatch"
 
 
+def _bad_cases(conn: sqlite3.Connection, *, run_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+          sr.conversation_id,
+          sr.message_id,
+          sr.rule_key,
+          sr.eval_hit,
+          sr.judge_expected_hit,
+          sr.eval_reason_code,
+          sr.eval_reason,
+          sr.judge_rationale,
+          sr.evidence_quote,
+          sr.eval_confidence,
+          sr.judge_confidence,
+          m.text
+        FROM scan_results sr
+        JOIN messages m ON m.message_id = sr.message_id
+        WHERE sr.run_id=? AND sr.judge_label=0
+        ORDER BY ABS(sr.eval_confidence - COALESCE(sr.judge_confidence, 0)) DESC, sr.rule_key, sr.message_id
+        LIMIT ?
+        """,
+        (run_id, int(limit)),
+    ).fetchall()
+    return [
+        {
+            "conversation_id": str(row["conversation_id"]),
+            "message_id": int(row["message_id"]),
+            "rule_key": str(row["rule_key"]),
+            "eval_hit": int(row["eval_hit"]),
+            "judge_expected_hit": None
+            if row["judge_expected_hit"] is None
+            else int(row["judge_expected_hit"]),
+            "eval_reason_code": str(row["eval_reason_code"]),
+            "eval_reason": str(row["eval_reason"]),
+            "judge_rationale": str(row["judge_rationale"] or ""),
+            "evidence_quote": str(row["evidence_quote"]),
+            "eval_confidence": float(row["eval_confidence"]),
+            "judge_confidence": None if row["judge_confidence"] is None else float(row["judge_confidence"]),
+            "text": str(row["text"]),
+        }
+        for row in rows
+    ]
+
+
+def _md_cell(text: str, max_len: int = 120) -> str:
+    clipped = text.replace("\n", " ").strip()
+    if len(clipped) > max_len:
+        clipped = clipped[: max(0, max_len - 1)] + "…"
+    return clipped.replace("|", "\\|")
+
+
 def build_report(
     conn: sqlite3.Connection,
     *,
@@ -644,12 +693,10 @@ def build_report(
         run_id=run_id,
         metrics_version=metrics_version,
     )
+
     current = _accuracy_map(conn, run_id=run_id)
     canonical = _accuracy_map(conn, run_id=canonical_run_id)
     rule_keys = [rule.key for rule in all_rules()]
-    vals_can = [canonical.get(key, 0.0) for key in rule_keys]
-    vals_cur = [current.get(key, 0.0) for key in rule_keys]
-    deltas = [cur - can for can, cur in zip(vals_can, vals_cur)]
 
     heatmap = _build_accuracy_heatmap_data(conn, run_id=run_id, rule_keys=rule_keys)
     conversation_ids = [str(value) for value in heatmap["conversation_ids"]]
@@ -662,8 +709,31 @@ def build_report(
         scores=scores,
         judged_totals=judged_totals,
     )
-    total_cells = len(conversation_ids) * len(rule_keys)
-    judged_cells = sum(1 for row in judged_totals for judged in row if int(judged) > 0)
+    bad_cases = _bad_cases(conn, run_id=run_id, limit=20)
+
+    run_summary = conn.execute(
+        "SELECT summary_json FROM scan_runs WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    inserted = int(
+        conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0]
+    )
+    judged = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM scan_results WHERE run_id=? AND judge_label IS NOT NULL",
+            (run_id,),
+        ).fetchone()[0]
+    )
+    llm_rows = conn.execute(
+        """
+        SELECT phase, COUNT(*) AS calls, SUM(CASE WHEN error_message<>'' THEN 1 ELSE 0 END) AS errors
+        FROM llm_calls
+        WHERE run_id=?
+        GROUP BY phase
+        ORDER BY phase
+        """,
+        (run_id,),
+    ).fetchall()
 
     ensure_parent(md_path)
     cfg = quality_thresholds()
@@ -673,16 +743,40 @@ def build_report(
         f"- metrics_version: `{metrics_version}`",
         f"- canonical_run_id: `{canonical_run_id}`",
         f"- current_run_id: `{run_id}`",
+        f"- inserted_results: `{inserted}`",
+        f"- judged_results: `{judged}`",
+        f"- judge_coverage: `{_safe_div(float(judged), float(inserted)):.4f}`",
         "",
-        "| rule | canonical_judge_correctness | current_judge_correctness | delta |",
+        "## Rule Quality (judge_correctness)",
+        "",
+        "| rule | canonical | current | delta |",
         "|---|---:|---:|---:|",
     ]
-    for idx, key in enumerate(rule_keys):
-        delta = deltas[idx]
+
+    for key in rule_keys:
+        can = canonical.get(key, 0.0)
+        cur = current.get(key, 0.0)
+        delta = cur - can
         sign = "+" if delta > 0 else ""
-        lines.append(f"| `{key}` | {vals_can[idx]:.4f} | {vals_cur[idx]:.4f} | {sign}{delta:.4f} |")
+        lines.append(f"| `{key}` | {can:.4f} | {cur:.4f} | {sign}{delta:.4f} |")
+
     if canonical_note:
         lines.extend(["", f"- note: {canonical_note}"])
+
+    lines.extend(
+        [
+            "",
+            "## LLM Calls (full trace persisted in `llm_calls`)",
+            "",
+            "| phase | calls | errors |",
+            "|---|---:|---:|",
+        ]
+    )
+    if llm_rows:
+        for row in llm_rows:
+            lines.append(f"| `{row['phase']}` | {int(row['calls'])} | {int(row['errors'] or 0)} |")
+    else:
+        lines.append("| `-` | 0 | 0 |")
 
     lines.extend(
         [
@@ -692,7 +786,6 @@ def build_report(
             f"- thresholds: `{threshold_doc_line(thresholds=cfg)}`",
             f"- conversations: `{len(conversation_ids)}`",
             f"- rules: `{len(rule_keys)}`",
-            f"- judged_cells: `{judged_cells}/{total_cells}`",
             "",
             "| zone | cells |",
             "|---|---:|",
@@ -707,6 +800,7 @@ def build_report(
             "|---|---|---:|---:|",
         ]
     )
+
     if worst_cells:
         for cell in worst_cells:
             lines.append(
@@ -715,7 +809,42 @@ def build_report(
     else:
         lines.append("| `-` | `-` | n/a | 0 |")
 
+    lines.extend(
+        [
+            "",
+            "## Judge-Confirmed Bad Cases (judge_label=0)",
+            "",
+            "| conversation_id | message_id | rule | eval_hit | expected_hit | reason_code | evidence_quote |",
+            "|---|---:|---|---:|---:|---|---|",
+        ]
+    )
+
+    if bad_cases:
+        for case in bad_cases:
+            lines.append(
+                f"| `{case['conversation_id']}` | {case['message_id']} | `{case['rule_key']}` | "
+                f"{case['eval_hit']} | {case['judge_expected_hit']} | `{_md_cell(str(case['eval_reason_code']), 60)}` | "
+                f"`{_md_cell(str(case['evidence_quote']), 80)}` |"
+            )
+
+        lines.extend(["", "### Bad Case Details", ""])
+        for idx, case in enumerate(bad_cases[:10], start=1):
+            lines.append(
+                f"{idx}. `{case['conversation_id']}` msg={case['message_id']} rule=`{case['rule_key']}` "
+                f"eval_hit={case['eval_hit']} expected_hit={case['judge_expected_hit']}"
+            )
+            lines.append(f"   text: {_md_cell(str(case['text']), 200)}")
+            lines.append(f"   evaluator_reason: {_md_cell(str(case['eval_reason']), 200)}")
+            lines.append(f"   judge_rationale: {_md_cell(str(case['judge_rationale']), 200)}")
+            lines.append(f"   evidence_quote: {_md_cell(str(case['evidence_quote']), 120)}")
+    else:
+        lines.append("| `-` | 0 | `-` | 0 | 0 | `-` | `-` |")
+
+    if run_summary is not None:
+        lines.extend(["", "## Run Summary JSON", "", f"- summary_json: `{str(run_summary['summary_json'])}`"])
+
     Path(md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     ensure_parent(png_path)
     write_accuracy_diff_png(
         png_path,
@@ -724,6 +853,7 @@ def build_report(
         scores=scores,
         thresholds=cfg,
     )
+
     return {
         "run_id": run_id,
         "canonical_run_id": canonical_run_id,
@@ -731,4 +861,5 @@ def build_report(
         "rules": len(rule_keys),
         "md_path": md_path,
         "png_path": png_path,
+        "bad_cases": len(bad_cases),
     }

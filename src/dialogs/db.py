@@ -5,18 +5,101 @@ from pathlib import Path
 
 from .utils import now_utc
 
+SCHEMA_DICTIONARY_RU: dict[str, dict[str, str]] = {
+    "conversations": {
+        "__table__": "Справочник диалогов: одна запись = один исходный разговор.",
+        "conversation_id": "Уникальный идентификатор диалога.",
+        "source_file_name": "Имя исходного CSV-файла, из которого загружен диалог.",
+        "message_count": "Количество сообщений в диалоге после загрузки.",
+        "created_at_utc": "Время первого создания записи диалога (UTC).",
+        "updated_at_utc": "Время последнего обновления записи диалога (UTC).",
+    },
+    "messages": {
+        "__table__": "Сообщения диалога в порядке появления; используются evaluator и judge.",
+        "message_id": "Уникальный числовой идентификатор сообщения.",
+        "conversation_id": "Идентификатор диалога, к которому относится сообщение.",
+        "source_chunk_id": "Порядковый номер чанка в исходном CSV.",
+        "message_order": "Порядок сообщения внутри диалога после сортировки.",
+        "speaker_label": "Нормализованная роль автора сообщения (Sales Rep/Customer/Unknown).",
+        "text": "Текст сообщения без изменений смысла.",
+        "created_at_utc": "Время первого создания записи сообщения (UTC).",
+        "updated_at_utc": "Время последнего обновления записи сообщения (UTC).",
+    },
+    "scan_runs": {
+        "__table__": "Реестр запусков сканирования качества.",
+        "run_id": "Уникальный идентификатор запуска scan.",
+        "model": "Имя модели LLM, использованной в запуске.",
+        "conversation_from": "Начальный индекс выбранного диапазона диалогов.",
+        "conversation_to": "Конечный индекс выбранного диапазона диалогов.",
+        "selected_conversations": "Фактическое число диалогов, попавших в запуск.",
+        "messages_count": "Число сообщений в выбранном диапазоне до фильтрации по роли.",
+        "status": "Статус запуска (running/success/failed).",
+        "started_at_utc": "Время старта запуска (UTC).",
+        "finished_at_utc": "Время завершения запуска (UTC).",
+        "summary_json": "Сводка counters и служебной информации запуска в JSON.",
+    },
+    "scan_results": {
+        "__table__": "Результаты проверки правила для конкретного сообщения продавца.",
+        "result_id": "Уникальный идентификатор результата.",
+        "run_id": "Идентификатор запуска scan.",
+        "conversation_id": "Идентификатор диалога результата.",
+        "message_id": "Идентификатор исходного сообщения.",
+        "rule_key": "Ключ проверяемого правила (greeting/upsell/empathy).",
+        "eval_hit": "Решение evaluator: найдено ли соблюдение правила.",
+        "eval_confidence": "Уверенность evaluator в решении [0..1].",
+        "eval_reason_code": "Код причины решения evaluator из фиксированного списка.",
+        "eval_reason": "Текстовое объяснение evaluator на русском языке.",
+        "evidence_quote": "Дословная цитата из сообщения как evidence.",
+        "evidence_message_id": "message_id, к которому относится evidence.",
+        "evidence_span_start": "Начальный индекс цитаты evidence в тексте сообщения.",
+        "evidence_span_end": "Конечный индекс цитаты evidence в тексте сообщения.",
+        "judge_expected_hit": "Ожидание judge о корректном hit для кейса.",
+        "judge_label": "Вердикт judge о корректности evaluator (1/0).",
+        "judge_confidence": "Уверенность judge в вердикте [0..1].",
+        "judge_rationale": "Краткое объяснение judge на русском языке.",
+        "created_at_utc": "Время создания результата (UTC).",
+        "updated_at_utc": "Время последнего обновления результата (UTC).",
+    },
+    "scan_metrics": {
+        "__table__": "Минимальные агрегаты качества по правилам для отчета.",
+        "run_id": "Идентификатор запуска scan.",
+        "rule_key": "Ключ правила.",
+        "judge_correctness": "Доля кейсов с judge_label=1 среди judged кейсов.",
+        "judged_total": "Количество кейсов по правилу, где есть judge_label.",
+        "judge_true": "Количество кейсов judge_label=1 по правилу.",
+        "judge_false": "Количество кейсов judge_label=0 по правилу.",
+        "created_at_utc": "Время записи агрегата (UTC).",
+    },
+    "llm_calls": {
+        "__table__": "Полный трасс всех вызовов LLM для аудита и дебага.",
+        "call_id": "Уникальный идентификатор вызова LLM.",
+        "run_id": "Идентификатор запуска scan.",
+        "phase": "Фаза вызова (evaluator/judge).",
+        "rule_key": "Ключ правила, для которого сделан вызов.",
+        "conversation_id": "Идентификатор диалога вызова.",
+        "message_id": "Идентификатор сообщения вызова.",
+        "attempt": "Номер попытки вызова (для ретраев).",
+        "request_json": "Полный JSON-запрос к провайдеру.",
+        "response_http_status": "HTTP-статус ответа провайдера.",
+        "response_json": "Полный JSON-ответ провайдера.",
+        "extracted_json": "Извлеченный JSON-фрагмент для валидации схемы.",
+        "parse_ok": "Флаг успешного JSON-parsing extracted_json.",
+        "validation_ok": "Флаг успешной валидации против pydantic-модели.",
+        "error_message": "Текст ошибки вызова/парсинга/валидации.",
+        "latency_ms": "Длительность вызова в миллисекундах.",
+        "created_at_utc": "Время создания записи трасса (UTC).",
+    },
+    "app_state": {
+        "__table__": "Небольшое key-value хранилище служебного состояния приложения.",
+        "key": "Ключ служебного состояния.",
+        "value": "Значение служебного состояния.",
+        "updated_at_utc": "Время последнего изменения значения (UTC).",
+    },
+}
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
-
-DROP TABLE IF EXISTS review_items;
-DROP TABLE IF EXISTS review_cases;
-DROP TABLE IF EXISTS rule_results;
-DROP TABLE IF EXISTS experiment_metrics;
-DROP TABLE IF EXISTS experiment_runs;
-DROP TABLE IF EXISTS rule_versions;
-DROP TABLE IF EXISTS rules;
-DROP TABLE IF EXISTS llm_runs;
-DROP TABLE IF EXISTS llm_calls;
 
 CREATE TABLE IF NOT EXISTS conversations (
   conversation_id TEXT PRIMARY KEY,
@@ -31,11 +114,8 @@ CREATE TABLE IF NOT EXISTS messages (
   conversation_id TEXT NOT NULL,
   source_chunk_id INTEGER NOT NULL,
   message_order INTEGER NOT NULL,
-  speaker_raw TEXT NOT NULL,
   speaker_label TEXT NOT NULL,
   text TEXT NOT NULL,
-  embedding_json TEXT NOT NULL,
-  extra_json TEXT NOT NULL DEFAULT '{}',
   created_at_utc TEXT NOT NULL,
   updated_at_utc TEXT NOT NULL,
   UNIQUE(conversation_id, source_chunk_id),
@@ -63,9 +143,13 @@ CREATE TABLE IF NOT EXISTS scan_results (
   rule_key TEXT NOT NULL,
   eval_hit INTEGER NOT NULL,
   eval_confidence REAL NOT NULL,
+  eval_reason_code TEXT NOT NULL,
+  eval_reason TEXT NOT NULL,
   evidence_quote TEXT NOT NULL,
   evidence_message_id INTEGER NOT NULL,
-  eval_reason TEXT NOT NULL,
+  evidence_span_start INTEGER NOT NULL,
+  evidence_span_end INTEGER NOT NULL,
+  judge_expected_hit INTEGER,
   judge_label INTEGER,
   judge_confidence REAL,
   judge_rationale TEXT,
@@ -77,12 +161,14 @@ CREATE TABLE IF NOT EXISTS scan_results (
 );
 
 CREATE TABLE IF NOT EXISTS scan_metrics (
-  metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL,
   rule_key TEXT NOT NULL,
-  metric_name TEXT NOT NULL,
-  metric_value REAL NOT NULL,
+  judge_correctness REAL NOT NULL,
+  judged_total INTEGER NOT NULL,
+  judge_true INTEGER NOT NULL,
+  judge_false INTEGER NOT NULL,
   created_at_utc TEXT NOT NULL,
+  PRIMARY KEY(run_id, rule_key),
   FOREIGN KEY(run_id) REFERENCES scan_runs(run_id)
 );
 
@@ -113,7 +199,6 @@ CREATE TABLE IF NOT EXISTS app_state (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(conversation_id, message_order);
 CREATE INDEX IF NOT EXISTS idx_scan_results_run_rule ON scan_results(run_id, rule_key);
-CREATE INDEX IF NOT EXISTS idx_scan_metrics_run_rule ON scan_metrics(run_id, rule_key, metric_name);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run_phase ON llm_calls(run_id, phase);
 """
 
@@ -201,3 +286,26 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value, now_utc()),
     )
     conn.commit()
+
+
+def schema_dictionary_missing_entries(conn: sqlite3.Connection) -> list[str]:
+    missing: list[str] = []
+    tables = [
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    ]
+    for table in tables:
+        table_dict = SCHEMA_DICTIONARY_RU.get(table)
+        if not table_dict or "__table__" not in table_dict:
+            missing.append(f"table:{table}")
+            table_dict = {}
+        columns = [
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+        for column in columns:
+            if column not in table_dict:
+                missing.append(f"column:{table}.{column}")
+    return missing

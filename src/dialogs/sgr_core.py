@@ -2,10 +2,10 @@ from __future__ import annotations
 
 """Core-бизнес логика SGR.
 
-Здесь сосредоточены:
-- карточки правил и prompt policy;
-- пороги качества и логика зон;
-- валидация evidence и soft-валидация консистентности judge.
+Этот модуль - единая точка, где зафиксированы:
+- бизнес-правила оценки продавца;
+- политика prompt-ов evaluator/judge;
+- проверки evidence и soft-флаги консистентности judge.
 """
 
 from collections.abc import Sequence
@@ -15,7 +15,7 @@ import re
 
 from .models import EvaluatorResult, JudgeResult, ReasonCode
 
-METRICS_VERSION = "v2_judge_correctness"
+METRICS_VERSION = "v3_minimal_judge_correctness"
 
 
 @dataclass(frozen=True)
@@ -34,12 +34,13 @@ class QualityThresholds:
     judge_coverage_min: float = 0.98
 
 
+# Бизнес-каталог правил намеренно жесткий: это контракт системы и тестов.
 RULES: tuple[RuleCard, ...] = (
     RuleCard(
         key="greeting",
         title_ru="Приветствие",
         what_to_check="Есть в сообщении продавца явное приветствие клиенту.",
-        why_it_matters="Первое касание задаёт тон диалога и влияет на доверие.",
+        why_it_matters="Первое касание задает тон диалога и влияет на доверие.",
     ),
     RuleCard(
         key="upsell",
@@ -50,7 +51,7 @@ RULES: tuple[RuleCard, ...] = (
     RuleCard(
         key="empathy",
         title_ru="Эмпатия",
-        what_to_check="По контексту диалога эмпатия уместна/нужна и в текущей реплике продавца она явно выражена.",
+        what_to_check="По контексту диалога эмпатия уместна и в реплике продавца выражена явно.",
         why_it_matters="Контекстная эмпатия снижает трение и повышает шанс конструктивного шага клиента.",
     ),
 )
@@ -65,26 +66,18 @@ RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
 
 RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
     "upsell": (
-        "Скидка/промокод сами по себе не считаются допродажей без новой опции/пакета/тарифа.",
-        "Информирование о статусе заказа без предложения следующего платного шага не является upsell.",
+        "Скидка/промокод без новой опции не считается допродажей.",
+        "Информирование о статусе без следующего платного шага не является upsell.",
     ),
     "empathy": (
-        "Приветствие и вежливые формулы (How are you / Have a great day / You're welcome) не равны эмпатии.",
-        "Позитивный тон без признания состояния/сложности клиента не считается эмпатией.",
-        "Промо/продажная информация без эмоционального acknowledgment не считается эмпатией.",
+        "Вежливость и small talk не равны эмпатии.",
+        "Позитивный тон без признания состояния клиента не считается эмпатией.",
     ),
 }
 
-_POSITIVE_RATIONALE_MARKERS = (
-    "оценка корректна",
-    "решение корректно",
-    "evaluator корректно",
-    "evaluator правильно",
-    "evaluator верно",
-    "assessment is correct",
-    "correctly",
-)
-_NEGATIVE_RATIONALE_MARKERS = ("некоррект", "неправиль", "ошиб", "incorrect", "wrong")
+# Эти маркеры участвуют только в мягкой проверке противоречий rationale.
+_POSITIVE_RATIONALE_MARKERS = ("оценка корректна", "evaluator корректно", "assessment is correct")
+_NEGATIVE_RATIONALE_MARKERS = ("некоррект", "ошиб", "incorrect")
 
 
 def all_rules() -> tuple[RuleCard, ...]:
@@ -120,6 +113,7 @@ def is_seller_message(speaker_label: str) -> bool:
 
 
 def build_chat_context(conversation_messages: Sequence[object], *, current_message_order: int) -> str:
+    # Контекст для evaluator/judge: только сообщения до текущего шага включительно.
     lines: list[str] = []
     for item in conversation_messages:
         order = int(item["message_order"])  # type: ignore[index]
@@ -137,8 +131,7 @@ def _reason_codes_for_rule(rule_key: str) -> str:
 
 
 def default_reason_code(rule_key: str, *, hit: bool) -> ReasonCode:
-    """Дефолтный business-code для тех редких случаев, когда payload evaluator не сохранился в кэше."""
-
+    # Фолбэк нужен для единичных случаев, когда evaluator payload отсутствует в кэше.
     if rule_key == "greeting":
         return "greeting_present" if hit else "greeting_missing"
     if rule_key == "upsell":
@@ -165,8 +158,9 @@ def build_evaluator_prompts(
     system_prompt = (
         "Ты evaluator качества продаж. "
         "Верни только JSON по строгой схеме. "
-        "Решение для empathy принимай строго по контексту чата. "
-        "Используй reason_code из разрешённого списка для текущего rule_key."
+        "Решение для empathy принимай только по chat context. "
+        "Используй reason_code из разрешенного списка для текущего rule_key. "
+        "reason пиши на русском; evidence.quote оставляй точной цитатой из исходного текста без перевода."
     )
     user_prompt = (
         f"Правило: {rule.key} ({rule.title_ru})\n"
@@ -180,11 +174,11 @@ def build_evaluator_prompts(
         "- evidence.quote обязан быть точной подстрокой text\n"
         "- evidence.span_start/evidence.span_end обязаны указывать точные границы quote в text\n"
         "- проверка: evidence.quote == text[evidence.span_start:evidence.span_end]\n"
-        f"Разрешённые reason_code для этого правила: {_reason_codes_for_rule(rule.key)}\n"
+        f"Разрешенные reason_code для этого правила: {_reason_codes_for_rule(rule.key)}\n"
     )
     if anti_patterns:
         user_prompt += f"Антипаттерны для {rule.key}:\n{anti_patterns}\n"
-    user_prompt += "Если hit=false, reason и reason_code всё равно обязательны.\n"
+    user_prompt += "Если hit=false, reason и reason_code все равно обязательны.\n"
     return system_prompt, user_prompt
 
 
@@ -200,7 +194,8 @@ def build_judge_prompts(
         "Ты независимый judge качества. "
         "Сначала определи expected_hit по правилу и контексту. "
         "Затем проверь корректность evaluator: label=true только если evaluator.hit == expected_hit. "
-        "Верни только JSON по схеме JudgeResult."
+        "Верни только JSON по схеме JudgeResult. "
+        "rationale пиши на русском; допускаются только дословные цитаты из исходного текста."
     )
     user_prompt = (
         f"Правило: {rule.key} ({rule.title_ru})\n"
@@ -211,30 +206,11 @@ def build_judge_prompts(
         "Ответ evaluator (JSON):\n"
         f"{json.dumps(evaluator.model_dump(), ensure_ascii=False)}\n"
         "Инструкция:\n"
-        "- expected_hit: твоя независимая оценка, должен ли быть hit\n"
+        "- expected_hit: твоя независимая оценка\n"
         "- label=true, если evaluator корректен; иначе false\n"
         "- rationale: кратко и без противоречий к label"
     )
     return system_prompt, user_prompt
-
-
-def build_rules_doc() -> str:
-    cfg = quality_thresholds()
-    lines = [
-        "# 3 hardcoded правила SGR",
-        "",
-        "- thresholds (Balanced):",
-        f"  - green >= {cfg.green_min:.2f}",
-        f"  - yellow >= {cfg.yellow_min:.2f}",
-        f"  - red < {cfg.yellow_min:.2f}",
-        f"  - rule alert: judge_correctness < {cfg.rule_alert_min:.2f}",
-        f"  - run health alert: judge_coverage < {cfg.judge_coverage_min:.2f}",
-    ]
-    for rule in RULES:
-        lines.append(f"- `{rule.key}`: {rule.title_ru}")
-        lines.append(f"  Проверяем: {rule.what_to_check}")
-        lines.append(f"  Почему важно: {rule.why_it_matters}")
-    return "\n".join(lines)
 
 
 def build_evidence_correction_note(message_id: int) -> str:
@@ -249,14 +225,15 @@ def build_evidence_correction_note(message_id: int) -> str:
 
 
 def normalize_evidence_span(result: EvaluatorResult, *, text: str) -> EvaluatorResult:
-    """Мягко чинит только span, если quote корректный, но индексы смещены."""
-
+    # Авто-фикс безопасен только когда quote корректный, а ошибка только в индексах.
     if not result.hit:
         return result
+
     evidence = result.evidence
     quote = evidence.quote.strip()
     if not quote:
         return result
+
     if 0 <= evidence.span_start <= evidence.span_end <= len(text):
         if text[evidence.span_start : evidence.span_end] == quote:
             return result
@@ -296,17 +273,14 @@ def evidence_error(result: EvaluatorResult, *, message_id: int, text: str) -> st
         return "evidence.span_end должен быть > evidence.span_start"
     if evidence.span_end > len(text):
         return "evidence.span_end выходит за длину message.text"
+
     span_text = text[evidence.span_start : evidence.span_end]
     if quote != span_text:
         return "evidence.quote не совпадает с text[span_start:span_end]"
     return None
 
 
-def judge_inconsistency_flags(
-    *,
-    evaluator_hit: bool,
-    judge: JudgeResult,
-) -> list[str]:
+def judge_inconsistency_flags(*, evaluator_hit: bool, judge: JudgeResult) -> list[str]:
     flags: list[str] = []
     expected_label = evaluator_hit == judge.expected_hit
     if bool(judge.label) != bool(expected_label):
