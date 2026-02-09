@@ -1,35 +1,26 @@
 # dialogs-sgr
 
-Минимальный SGR-сканер для 3 hardcoded правил:
-- `greeting`
-- `upsell`
-- `empathy`
+Минимальный SGR-сканер для 3 hardcoded правил (`greeting`, `upsell`, `empathy`) с SQLite, evaluator и `llm as judge`.
 
-Evaluator и `llm as judge` запускаются последовательно в одном `run_id`.
-Таргет оценки: только `Sales Rep`.
-Реплики `Customer` не оцениваются напрямую и используются только как контекст чата.
-Правило `empathy` определяется LLM строго по контексту чата, без keyword/threshold/gating в коде.
-Policy ошибок: schema-level ошибки (invalid_json_schema / validation schema mismatch) останавливают run.
-Если `evidence.quote/message_id` невалиден после второй попытки evaluator, кейс пропускается, run продолжается.
-`artifacts/accuracy_diff.png` формируется как judge-aligned heatmap `conversation x rule` с зонами качества.
-
-## Один основной запуск
+## Quickstart (с нуля, единый Python setup)
 ```bash
-PYTHONPATH=src python3 sgr_demo.py
-```
-
-## Главные файлы
-- Core бизнес-логики: `src/dialogs/sgr_core.py`
-- Отдельный judge-pass: `src/dialogs/llm_as_judge.py`
-- Оркестрация run/report: `src/dialogs/pipeline.py`
-- Тесты-документация: `tests/test_platform_dataset_style.py`
-- JSON schema regression: `tests/test_json_schema_regression.py`
-- SQL аналитика: `docs/analytics_sql.md`
-
-## Быстрые команды
-```bash
+make setup
 make init-fresh
+export OPENAI_API_KEY=...
 make scan
 make report
 make test
 ```
+
+Для ноутбука:
+```bash
+make notebook
+```
+и в Jupyter выбрать kernel `Python (dialogs-sgr)`.
+
+Если в ноутбуке `ModuleNotFoundError` (`pydantic`, `pandas`, `openai`), значит выбран не kernel `Python (dialogs-sgr)`.
+
+## Что важно
+- Все `make`-команды работают через `.venv/bin/python` (без `source .venv/bin/activate`).
+- Базовая метрика качества: `judge_correctness` (`judge_label=1` означает корректность evaluator).
+- Пороги качества централизованы в `src/dialogs/sgr_core.py` (Balanced): `green>=0.90`, `yellow>=0.80`, `red<0.80`.

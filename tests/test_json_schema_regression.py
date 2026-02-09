@@ -31,7 +31,8 @@ PARSER_CASES = [
         "payload": {
             "hit": True,
             "confidence": 0.73,
-            "evidence": {"quote": "Здравствуйте", "message_id": 10},
+            "evidence": {"quote": "Здравствуйте", "message_id": 10, "span_start": 0, "span_end": 11},
+            "reason_code": "greeting_present",
             "reason": "Есть корректное приветствие",
         },
         "ожидается_ошибка": False,
@@ -43,7 +44,8 @@ PARSER_CASES = [
         "payload": {
             "hit": True,
             "confidence": 1.2,
-            "evidence": {"quote": "Здравствуйте", "message_id": 10},
+            "evidence": {"quote": "Здравствуйте", "message_id": 10, "span_start": 0, "span_end": 11},
+            "reason_code": "greeting_present",
             "reason": "Неверно",
         },
         "ожидается_ошибка": True,
@@ -55,10 +57,31 @@ PARSER_CASES = [
         "payload": {
             "hit": False,
             "confidence": 0.2,
-            "evidence": {"quote": "", "message_id": 10},
+            "evidence": {"quote": "", "message_id": 10, "span_start": 0, "span_end": 0},
+            "reason_code": "greeting_missing",
             "reason": "Нет условия",
             "extra": "not allowed",
         },
+        "ожидается_ошибка": True,
+    },
+    {
+        "код": "evaluator_reason_code_invalid",
+        "описание": "reason_code должен быть из фиксированного списка.",
+        "модель": EvaluatorResult,
+        "payload": {
+            "hit": False,
+            "confidence": 0.2,
+            "evidence": {"quote": "", "message_id": 10, "span_start": 0, "span_end": 0},
+            "reason_code": "invalid_code",
+            "reason": "Нет условия",
+        },
+        "ожидается_ошибка": True,
+    },
+    {
+        "код": "evidence_span_invalid",
+        "описание": "span_end должен быть >= span_start.",
+        "модель": Evidence,
+        "payload": {"quote": "abc", "message_id": 1, "span_start": 3, "span_end": 2},
         "ожидается_ошибка": True,
     },
     {
@@ -66,6 +89,7 @@ PARSER_CASES = [
         "описание": "Валидный judge JSON проходит парсер.",
         "модель": JudgeResult,
         "payload": {
+            "expected_hit": True,
             "label": True,
             "confidence": 0.91,
             "rationale": "Evaluator корректно применил правило",
@@ -77,6 +101,7 @@ PARSER_CASES = [
         "описание": "Отсутствие обязательного поля (rationale) дает ошибку.",
         "модель": JudgeResult,
         "payload": {
+            "expected_hit": True,
             "label": True,
             "confidence": 0.91,
         },

@@ -8,12 +8,13 @@ src/dialogs/demo.py
 src/dialogs/eval.py
 src/dialogs/ingest.py
 src/dialogs/llm.py
+src/dialogs/llm_as_judge.py
 src/dialogs/main.py
 src/dialogs/messages.py
-src/dialogs/mini_model.py
 src/dialogs/models.py
-src/dialogs/reviews.py
-src/dialogs/rules.py
+src/dialogs/pipeline.py
+src/dialogs/report_image.py
+src/dialogs/sgr_core.py
 src/dialogs/utils.py
 src/dialogs_sgr.egg-info/PKG-INFO
 src/dialogs_sgr.egg-info/SOURCES.txt
@@ -21,4 +22,5 @@ src/dialogs_sgr.egg-info/dependency_links.txt
 src/dialogs_sgr.egg-info/entry_points.txt
 src/dialogs_sgr.egg-info/requires.txt
 src/dialogs_sgr.egg-info/top_level.txt
+tests/test_json_schema_regression.py
 tests/test_platform_dataset_style.py

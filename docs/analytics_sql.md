@@ -132,7 +132,7 @@ FROM scan_results r
 JOIN messages m ON m.message_id = r.message_id
 WHERE r.run_id=(SELECT run_id FROM last_run)
   AND r.judge_label IS NOT NULL
-  AND r.eval_hit <> r.judge_label
+  AND r.judge_label=0
 ORDER BY ABS(r.eval_confidence - COALESCE(r.judge_confidence, 0)) DESC,
          r.rule_key,
          r.message_id
@@ -152,12 +152,12 @@ SELECT
   r.conversation_id,
   r.rule_key,
   SUM(CASE WHEN r.judge_label IS NOT NULL THEN 1 ELSE 0 END) AS judged_total,
-  SUM(CASE WHEN r.judge_label IS NOT NULL AND r.eval_hit = r.judge_label THEN 1 ELSE 0 END) AS agree_total,
-  SUM(CASE WHEN r.judge_label IS NOT NULL AND r.eval_hit <> r.judge_label THEN 1 ELSE 0 END) AS disagree_total,
+  SUM(CASE WHEN r.judge_label=1 THEN 1 ELSE 0 END) AS agree_total,
+  SUM(CASE WHEN r.judge_label=0 THEN 1 ELSE 0 END) AS disagree_total,
   CASE
     WHEN SUM(CASE WHEN r.judge_label IS NOT NULL THEN 1 ELSE 0 END) = 0 THEN NULL
     ELSE
-      1.0 * SUM(CASE WHEN r.judge_label IS NOT NULL AND r.eval_hit = r.judge_label THEN 1 ELSE 0 END)
+      1.0 * SUM(CASE WHEN r.judge_label=1 THEN 1 ELSE 0 END)
       / SUM(CASE WHEN r.judge_label IS NOT NULL THEN 1 ELSE 0 END)
   END AS agreement_rate
 FROM scan_results r
@@ -202,8 +202,9 @@ WHERE run_id=(SELECT run_id FROM last_run)
 ```
 
 ## 9) Как интерпретировать
-- `coverage` растет: evaluator чаще срабатывает (`eval_hit=1`) на judged-кейсах.
-- `precision` падает: становится больше ложных срабатываний (`fp`).
-- `recall` растет: меньше пропусков (`fn`).
+- `judge_correctness`/`accuracy`: доля кейсов, где `judge_label=1` (evaluator применил правило корректно).
+- `coverage`: доля `eval_hit=1` среди judged-кейсов; это не качество, а частота срабатывания evaluator.
+- `precision/recall/f1`: считаются относительно judge-корректности (исправленная семантика `tp/fp/tn/fn`).
 - `delta` (current - canonical): `>0` улучшение, `<0` регресс относительно канона.
+- Heatmap-зоны задаются централизованно в `sgr_core` (Balanced): `green>=0.90`, `yellow>=0.80`, `red<0.80`.
 - Для `empathy` всегда учитывайте, что оценка делается через chat context, а не по isolated message.

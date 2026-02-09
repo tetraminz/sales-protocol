@@ -6,88 +6,35 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: openai>=1.58.0
 Requires-Dist: pydantic>=2.9.0
-Requires-Dist: typer>=0.12.5
-Requires-Dist: pandas>=2.2.0
-Requires-Dist: matplotlib>=3.9.0
+Requires-Dist: Pillow>=10.0.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.3.0; extra == "dev"
 Requires-Dist: jupyter>=1.1.1; extra == "dev"
 Requires-Dist: ipykernel>=6.29.5; extra == "dev"
+Requires-Dist: pandas>=2.2.0; extra == "dev"
 
-# dialogs-sgr (Python-only)
+# dialogs-sgr
 
-Короткая демонстрационная платформа SGR для C-level/CTO:
-- snapshot диалогов в `csv/`
-- рабочая SQLite база `dialogs.db`
-- tiny CLI `dialogs`
-- baseline vs SGR с full LLM debug в БД
-- DIF точности в `artifacts/accuracy_diff.png` и `artifacts/metrics.md`
+Минимальный SGR-сканер для 3 hardcoded правил (`greeting`, `upsell`, `empathy`) с SQLite, evaluator и `llm as judge`.
 
-## Почему этот дизайн
-- Минимальный core и короткий demo-поток
-- Полная трассировка LLM (`llm_runs`, `llm_calls`)
-- Бизнес-правила на RU/EN через `rules add --nl ...` с `DRAFT -> ACTIVE`
-
-## Установка
+## Quickstart (с нуля, единый Python setup)
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .[dev]
+make setup
+make init-fresh
+make scan
+make report
+make test
 ```
 
-Если зависимости пока не установлены:
+Для ноутбука:
 ```bash
-PYTHONPATH=src python3 -m dialogs.main --help
+make notebook
 ```
+и в Jupyter выбрать kernel `Python (dialogs-sgr)`.
 
-## Основные команды
-```bash
-dialogs db init --db dialogs.db
-dialogs data ingest-csv --csv-dir csv --db dialogs.db --replace
-dialogs db stats --db dialogs.db
-dialogs conversations list --db dialogs.db --limit 20
-dialogs conversations show --id modamart__0_transcript --db dialogs.db
+Если в ноутбуке `ModuleNotFoundError` (`pydantic`, `pandas`, `openai`), значит выбран не kernel `Python (dialogs-sgr)`.
 
-# правила
-dialogs rules add --nl "Проверь, что продавец здоровается" --lang ru --db dialogs.db
-dialogs rules list --db dialogs.db
-dialogs rules approve --rule-id 1 --db dialogs.db
-
-# eval
-dialogs run eval --mode baseline --db dialogs.db --rule-set default
-dialogs run eval --mode sgr --db dialogs.db --rule-set default
-
-# diff
-dialogs run diff --run-a <baseline_run_id> --run-b <sgr_run_id> --db dialogs.db --png artifacts/accuracy_diff.png --md artifacts/metrics.md
-
-# llm debug
-dialogs llm logs --run-id <llm_run_id> --db dialogs.db --failed-only
-```
-
-## Минимальный demo
-```bash
-PYTHONPATH=src python3 -m dialogs.demo
-# или
-PYTHONPATH=src python3 sgr_demo.py
-```
-
-`dialogs.demo` делает: init -> ingest -> baseline -> sgr -> diff.
-
-## SQLite сущности
-- `conversations`, `messages`
-- `rules`, `rule_versions`, `rule_results`
-- `llm_runs`, `llm_calls`
-- `experiment_runs`, `experiment_metrics`
-- `review_cases`, `review_items`
-
-## Тесты
-Dataset-style field assertions (по схеме из `docs/SKILL.md`):
-```bash
-PYTHONPATH=src pytest -q
-```
-
-## После установки top dependencies
-См. `docs/POST_INSTALL_CHECKLIST.md`:
-- live OpenAI прогон через Responses API
-- notebook top-to-bottom
-- full regression-проверка pydantic/typer/pandas/matplotlib слоя
+## Что важно
+- Все `make`-команды работают через `.venv/bin/python` (без `source .venv/bin/activate`).
+- Базовая метрика качества: `judge_correctness` (`judge_label=1` означает корректность evaluator).
+- Пороги качества централизованы в `src/dialogs/sgr_core.py` (Balanced): `green>=0.90`, `yellow>=0.80`, `red<0.80`.
