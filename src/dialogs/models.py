@@ -44,16 +44,6 @@ class RuleEvaluation(BaseModel):
         return self
 
 
-class BundledEvaluatorResult(BaseModel):
-    """Ответ evaluator для одной реплики продавца сразу по всем правилам."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    greeting: RuleEvaluation
-    upsell: RuleEvaluation
-    empathy: RuleEvaluation
-
-
 class RuleJudgeEvaluation(BaseModel):
     """Вердикт judge по одному правилу для конкретной реплики продавца."""
 
@@ -63,13 +53,3 @@ class RuleJudgeEvaluation(BaseModel):
     label: bool
     confidence: float = Field(ge=0, le=1)
     rationale: str
-
-
-class BundledJudgeResult(BaseModel):
-    """Ответ judge для одной реплики продавца сразу по всем правилам."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    greeting: RuleJudgeEvaluation
-    upsell: RuleJudgeEvaluation
-    empathy: RuleJudgeEvaluation

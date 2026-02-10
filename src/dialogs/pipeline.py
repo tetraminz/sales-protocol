@@ -6,20 +6,24 @@ from pathlib import Path
 from typing import Any
 
 from .db import get_state, set_state
+from .judge import (
+    build_evaluator_bundle_model,
+    build_judge_bundle_model,
+    build_judge_prompt,
+    evaluator_results_by_rule,
+    judge_results_by_rule,
+)
 from .llm import LLMClient
-from .models import BundledEvaluatorResult, BundledJudgeResult
 from .report_image import write_accuracy_diff_png
 from .sgr_core import (
     METRICS_VERSION,
     all_rules,
     build_chat_context,
     build_evaluator_prompts_bundle,
-    build_judge_prompts_bundle,
-    evaluator_results_by_rule,
+    build_rule_business_context,
     greeting_window_refs,
     heatmap_zone,
     is_seller_message,
-    judge_results_by_rule,
     quality_thresholds,
     seller_message_refs,
     threshold_doc_line,
@@ -208,6 +212,10 @@ def run_scan(
         by_conversation.setdefault(str(message["conversation_id"]), []).append(message)
 
     rules = all_rules()
+    rule_keys = tuple(rule.key for rule in rules)
+    evaluator_bundle_model = build_evaluator_bundle_model(rule_keys)
+    judge_bundle_model = build_judge_bundle_model(rule_keys)
+    rule_business_context = build_rule_business_context(rules)
     run_id = run_id_override or f"scan_{uuid.uuid4().hex[:12]}"
     seller_messages = sum(1 for msg in messages if is_seller_message(str(msg["speaker_label"])))
     _insert_run(
@@ -292,7 +300,7 @@ def run_scan(
                 rule_key="bundle",
                 conversation_id=conversation_id,
                 message_id=llm_message_id,
-                model_type=BundledEvaluatorResult,
+                model_type=evaluator_bundle_model,
                 system_prompt=eval_sys,
                 user_prompt=eval_user,
                 attempt=1,
@@ -307,11 +315,11 @@ def run_scan(
                     call_error=eval_call.error_message,
                     is_schema_error=eval_call.is_schema_error,
                 )
-            if not isinstance(eval_call.parsed, BundledEvaluatorResult):
+            if not isinstance(eval_call.parsed, evaluator_bundle_model):
                 counters["schema_errors"] += 1
                 raise ValueError("schema_error evaluator payload type mismatch")
 
-            eval_by_rule = evaluator_results_by_rule(eval_call.parsed)
+            eval_by_rule = evaluator_results_by_rule(eval_call.parsed, rule_keys=rule_keys)
             for rule in rules:
                 eval_result = eval_by_rule[rule.key]
                 if not bool(eval_result.hit):
@@ -352,14 +360,14 @@ def run_scan(
                         f"(conversation_id={conversation_id}, evidence_message_id={evidence_message_id})"
                     )
 
-            judge_sys, judge_user = build_judge_prompts_bundle(
-                rules,
+            judge_sys, judge_user = build_judge_prompt(
                 conversation_id=conversation_id,
                 chat_context=chat_context,
                 seller_catalog=seller_catalog,
-                evaluator=eval_call.parsed,
+                evaluator_payload=eval_call.parsed.model_dump(),
                 context_mode=context_mode,
                 greeting_window_max=greeting_window_max,
+                rule_contexts=rule_business_context,
             )
             judge_call = llm.call_json_schema(
                 conn,
@@ -368,7 +376,7 @@ def run_scan(
                 rule_key="bundle",
                 conversation_id=conversation_id,
                 message_id=llm_message_id,
-                model_type=BundledJudgeResult,
+                model_type=judge_bundle_model,
                 system_prompt=judge_sys,
                 user_prompt=judge_user,
                 attempt=1,
@@ -383,10 +391,10 @@ def run_scan(
                     call_error=judge_call.error_message,
                     is_schema_error=judge_call.is_schema_error,
                 )
-            if not isinstance(judge_call.parsed, BundledJudgeResult):
+            if not isinstance(judge_call.parsed, judge_bundle_model):
                 counters["schema_errors"] += 1
                 raise ValueError("schema_error judge payload type mismatch")
-            judge_by_rule = judge_results_by_rule(judge_call.parsed)
+            judge_by_rule = judge_results_by_rule(judge_call.parsed, rule_keys=rule_keys)
 
             for rule in rules:
                 eval_result = eval_by_rule[rule.key]

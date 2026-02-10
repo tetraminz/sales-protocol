@@ -8,8 +8,9 @@ import tempfile
 from .db import connect, init_db
 from .ingest import ingest_csv_dir
 from .llm import CallResult
-from .models import BundledEvaluatorResult, BundledJudgeResult, RuleEvaluation, RuleJudgeEvaluation
+from .models import RuleEvaluation, RuleJudgeEvaluation
 from .pipeline import build_report, run_scan
+from .sgr_core import all_rules
 from .utils import now_utc
 
 
@@ -77,6 +78,9 @@ class DocsLLM:
 
     model = "docs-fake-model"
 
+    def __init__(self, *, rule_keys: tuple[str, ...]) -> None:
+        self.rule_keys = tuple(rule_keys)
+
     def require_live(self, purpose: str) -> None:  # noqa: ARG002
         return None
 
@@ -137,7 +141,7 @@ class DocsLLM:
             )
             conn.commit()
 
-        if model_type is BundledEvaluatorResult:
+        if phase == "evaluator":
             rows = conn.execute(
                 """
                 SELECT message_id, message_order, text
@@ -155,8 +159,8 @@ class DocsLLM:
                 }
                 for row in rows
             ]
-            payload = {}
-            for rule_key in ("greeting", "upsell", "empathy"):
+            payload: dict[str, RuleEvaluation] = {}
+            for rule_key in self.rule_keys:
                 hit, reason_code, quote, evidence_message_id, evidence_message_order = _eval_rule(rule_key, seller_rows)
                 payload[rule_key] = RuleEvaluation(
                     hit=hit,
@@ -167,24 +171,24 @@ class DocsLLM:
                     evidence_message_id=evidence_message_id,
                     evidence_message_order=evidence_message_order,
                 )
-            parsed = BundledEvaluatorResult(**payload)
+            parsed = model_type.model_validate(payload)
             _persist_log(response_chars=len(parsed.model_dump_json()), extracted_payload=parsed.model_dump())
             return CallResult(parsed, True, True, "", False, False)
 
-        if model_type is BundledJudgeResult:
+        if phase == "judge":
             evaluator_text = user_prompt.partition("Ответ evaluator (JSON):")[2].strip()
             evaluator_payload = json.loads(evaluator_text) if evaluator_text else {}
-            evaluator = BundledEvaluatorResult.model_validate(evaluator_payload)
             out: dict[str, RuleJudgeEvaluation] = {}
-            for rule_key in ("greeting", "upsell", "empathy"):
-                eval_hit = bool(getattr(evaluator, rule_key).hit)
+            for rule_key in self.rule_keys:
+                eval_row = evaluator_payload.get(rule_key, {})
+                eval_hit = bool(eval_row.get("hit")) if isinstance(eval_row, dict) else False
                 out[rule_key] = RuleJudgeEvaluation(
                     expected_hit=eval_hit,
                     label=True,
                     confidence=0.75,
                     rationale="ok",
                 )
-            parsed = BundledJudgeResult(**out)
+            parsed = model_type.model_validate(out)
             _persist_log(response_chars=len(parsed.model_dump_json()), extracted_payload=parsed.model_dump())
             return CallResult(parsed, True, True, "", False, False)
 
@@ -206,9 +210,10 @@ def refresh_docs(
         init_db(tmp_db)
         with connect(tmp_db) as conn:
             ingest_csv_dir(conn, csv_dir=csv_dir, replace=True)
+            rule_keys = tuple(rule.key for rule in all_rules())
             run_id = run_scan(
                 conn,
-                llm=DocsLLM(),
+                llm=DocsLLM(rule_keys=rule_keys),
                 conversation_from=conversation_from,
                 conversation_to=conversation_to,
                 run_id_override="docs_refresh",

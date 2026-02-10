@@ -37,6 +37,7 @@
 ## Допустимые термины и где они определены
 
 - Термины бизнес-правил и порогов: [`src/dialogs/sgr_core.py`](../src/dialogs/sgr_core.py)
+- Техническая реализация независимого judge-слоя: [`src/dialogs/judge/`](../src/dialogs/judge/)
 - Термины схемы и полей БД: [`src/dialogs/db.py`](../src/dialogs/db.py)
 - Контракт запуска и интерпретации: [`README.md`](../README.md)
 - Визуальная интерпретация для руководства: [`notebooks/sgr_quality_demo.ipynb`](../notebooks/sgr_quality_demo.ipynb)
@@ -46,6 +47,7 @@
 Любой новый термин или политика исполнения добавляются одновременно в doc-contract точки:
 - `README.md`
 - `src/dialogs/sgr_core.py`
+- `docs/judge_module.md`
 - `tests/test_platform_dataset_style.py`
 - `notebooks/sgr_quality_demo.ipynb`
 - `artifacts/metrics.md`

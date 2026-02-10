@@ -5,7 +5,7 @@ from __future__ import annotations
 Роль модуля в пайплайне:
 - задает стабильный бизнес-контракт правил (`greeting`, `upsell`, `empathy`);
 - задает пороги качества для heatmap и отчетов;
-- формирует prompt-шаблоны evaluator/judge;
+- формирует prompt-шаблон evaluator;
 - фиксирует quote-contract как обязательное условие доказуемости.
 
 Границы ответственности:
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import json
 from typing import Literal
 
-from .models import BundledEvaluatorResult, BundledJudgeResult, ReasonCode, RuleEvaluation, RuleJudgeEvaluation
+from .models import ReasonCode
 
 METRICS_VERSION = "v5_dialog_level_bundle"
 
@@ -110,6 +110,13 @@ RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
         "Позитивный тон без признания состояния клиента не считается эмпатией.",
     ),
 }
+
+# КАК ДОБАВИТЬ НОВОЕ RULE:
+# 1) Добавьте новую RuleCard в RULES (key/title_ru/what_to_check/why_it_matters/...).
+# 2) Добавьте reason_codes в RULE_REASON_CODES и антипаттерны в RULE_ANTI_PATTERNS.
+# 3) Проверьте тестовые фикстуры и fake-LLM в tests/ и docs_refresh (они должны брать rule_keys из all_rules()).
+# 4) Прогоните `make test && make docs` и убедитесь, что scan/report контракт остался стабильным.
+# 5) Если изменился публичный бизнес-термин, синхронно обновите doc-contract файлы из docs/stability_case_review.md.
 
 
 # Блок доступа к контракту правил и порогов.
@@ -234,6 +241,25 @@ def _anti_patterns_for_rule(rule_key: str) -> str:
     return "\n".join(f"- {item}" for item in values)
 
 
+def build_rule_business_context(rules: Sequence[RuleCard]) -> list[dict[str, object]]:
+    """Готовит бизнес-контекст правил для внешних модулей оценки (например, judge)."""
+
+    return [
+        {
+            "key": str(rule.key),
+            "title_ru": str(rule.title_ru),
+            "what_to_check": str(rule.what_to_check),
+            "why_it_matters": str(rule.why_it_matters),
+            "evaluation_scope": str(rule.evaluation_scope),
+            "seller_window_max": None if rule.seller_window_max is None else int(rule.seller_window_max),
+            "hit_policy": str(rule.hit_policy),
+            "reason_codes": tuple(str(code) for code in RULE_REASON_CODES.get(rule.key, ())),
+            "anti_patterns": tuple(str(item) for item in RULE_ANTI_PATTERNS.get(rule.key, ())),
+        }
+        for rule in rules
+    ]
+
+
 def _seller_catalog_json(seller_catalog: Sequence[SellerMessageRef]) -> str:
     payload = [
         {
@@ -274,8 +300,8 @@ def build_evaluator_prompts_bundle(
 
     system_prompt = (
         "Ты evaluator качества продаж. "
-        "Верни только JSON по схеме BundledEvaluatorResult. "
-        "Оцени greeting/upsell/empathy отдельно на уровне всего диалога. "
+        "Верни только JSON по bundled evaluator schema. "
+        "Оцени каждое правило из блока 'Правила для оценки' отдельно на уровне всего диалога. "
         "reason пиши на русском. "
         "Quote-contract обязателен: для hit=true evidence_quote должен быть дословной непустой "
         "contiguous подстрокой anchor seller-сообщения, символ-в-символ и на том же языке. "
@@ -336,71 +362,3 @@ def build_evaluator_prompts_bundle(
         ]
     )
     return system_prompt, "\n".join(lines)
-
-
-def build_judge_prompts_bundle(
-    rules: Sequence[RuleCard],
-    *,
-    conversation_id: str,
-    chat_context: str,
-    seller_catalog: Sequence[SellerMessageRef],
-    evaluator: BundledEvaluatorResult,
-    context_mode: str,
-    greeting_window_max: int,
-) -> tuple[str, str]:
-    """Формирует bundled-prompt judge: один вызов на диалог, все правила сразу."""
-
-    system_prompt = (
-        "Ты независимый judge качества. "
-        "Для каждого правила сначала вычисли expected_hit по контексту диалога, "
-        "затем выставь label=true только если evaluator.hit совпал с expected_hit. "
-        "Учитывай greeting только в первых greeting_window_max seller-сообщениях. "
-        "Верни только JSON по схеме BundledJudgeResult. "
-        "rationale пиши кратко на русском."
-    )
-
-    lines = [
-        f"conversation_id={conversation_id}",
-        f"context_mode={context_mode}",
-        f"greeting_window_max={int(greeting_window_max)}",
-        "BEGIN_SELLER_CATALOG_JSON",
-        _seller_catalog_json(seller_catalog),
-        "END_SELLER_CATALOG_JSON",
-        "Контекст чата:",
-        chat_context,
-        "",
-        "Правила для проверки:",
-    ]
-    for rule in rules:
-        lines.append(
-            f"- {rule.key}: scope={rule.evaluation_scope}, hit_policy={rule.hit_policy}, seller_window_max={rule.seller_window_max}"
-        )
-    lines.extend(
-        [
-            "",
-            "Ответ evaluator (JSON):",
-            json.dumps(evaluator.model_dump(), ensure_ascii=False),
-        ]
-    )
-    return system_prompt, "\n".join(lines)
-
-
-# Блок маппинга bundled payload в rule-key словари.
-def evaluator_results_by_rule(result: BundledEvaluatorResult) -> dict[str, RuleEvaluation]:
-    """Удобный доступ к bundled evaluator-результатам по ключу правила."""
-
-    return {
-        "greeting": result.greeting,
-        "upsell": result.upsell,
-        "empathy": result.empathy,
-    }
-
-
-def judge_results_by_rule(result: BundledJudgeResult) -> dict[str, RuleJudgeEvaluation]:
-    """Удобный доступ к bundled judge-результатам по ключу правила."""
-
-    return {
-        "greeting": result.greeting,
-        "upsell": result.upsell,
-        "empathy": result.empathy,
-    }
