@@ -18,9 +18,12 @@ class _StrictBundleModel(BaseModel):
 
 # КАК ДОБАВИТЬ НОВОЕ RULE:
 # 1) Добавьте RuleCard в src/dialogs/sgr_core.py -> RULES.
-# 2) Обновите reason_codes/anti_patterns в sgr_core для нового ключа.
-# 3) Ничего не меняйте здесь вручную: bundled schema строится по rule_keys автоматически.
-# 4) Инварианты, которые нельзя нарушать:
+# 2) Обновите ReasonCode в src/dialogs/models.py.
+# 3) Обновите reason_codes/anti_patterns в sgr_core для нового ключа.
+# 4) Обновите deterministic/fake-контуры в tests/ и docs_refresh.
+# 5) При публичной смене термина сделайте version bump METRICS_VERSION в sgr_core.
+# 6) Ничего не меняйте здесь вручную: bundled schema строится по rule_keys автоматически.
+# 7) Инварианты, которые нельзя нарушать:
 #    - поля bundled-схемы обязательны для всех rule_keys;
 #    - additionalProperties=false (strict-contract);
 #    - порядок rule_keys должен быть стабильным (из all_rules()).

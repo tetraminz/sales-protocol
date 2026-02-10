@@ -3,7 +3,7 @@ from __future__ import annotations
 """Core SGR-логика для dialog-level оценки качества продаж.
 
 Роль модуля в пайплайне:
-- задает стабильный бизнес-контракт правил (`greeting`, `upsell`, `empathy`);
+- задает стабильный бизнес-контракт правил (`greeting`, `next_step`, `empathy`);
 - задает пороги качества для heatmap и отчетов;
 - формирует prompt-шаблон evaluator;
 - фиксирует quote-contract как обязательное условие доказуемости.
@@ -20,7 +20,7 @@ from typing import Literal
 
 from .models import ReasonCode
 
-METRICS_VERSION = "v5_dialog_level_bundle"
+METRICS_VERSION = "v6_dialog_level_bundle"
 
 EvaluationScope = Literal["conversation"]
 HitPolicy = Literal["any_occurrence"]
@@ -63,7 +63,7 @@ class SellerMessageRef:
 
 @dataclass(frozen=True)
 class ScanPolicy:
-    """Фиксированная scan-policy v5 для интерпретируемых метрик/отчетов."""
+    """Фиксированная scan-policy v6 для интерпретируемых метрик/отчетов."""
 
     bundle_rules: bool = True
     judge_mode: JudgeMode = "full"
@@ -73,10 +73,12 @@ class ScanPolicy:
 
 # КАК ДОБАВИТЬ НОВОЕ RULE:
 # 1) Добавьте новую RuleCard в RULES (key/title_ru/what_to_check/why_it_matters/...).
-# 2) Добавьте reason_codes в RULE_REASON_CODES и антипаттерны в RULE_ANTI_PATTERNS.
-# 3) Проверьте тестовые фикстуры и fake-LLM в tests/ и docs_refresh (они должны брать rule_keys из all_rules()).
-# 4) Прогоните `make test && make docs` и убедитесь, что scan/report контракт остался стабильным.
-# 5) Если изменился публичный бизнес-термин, синхронно обновите doc-contract файлы из docs/stability_case_review.md.
+# 2) Добавьте reason_code в src/dialogs/models.py -> ReasonCode.
+# 3) Добавьте reason_codes в RULE_REASON_CODES и антипаттерны в RULE_ANTI_PATTERNS.
+# 4) Обновите deterministic/fake-контуры в src/dialogs/sgr_core_deterministic.py, tests/ и docs_refresh.
+# 5) Если изменился публичный бизнес-термин/ключ, сделайте version bump METRICS_VERSION.
+# 6) Синхронно обновите doc-contract файлы из docs/stability_case_review.md.
+# 7) Прогоните `make test && make docs` и убедитесь, что scan/report контракт остался стабильным.
 
 
 RULES: tuple[RuleCard, ...] = (
@@ -90,10 +92,10 @@ RULES: tuple[RuleCard, ...] = (
         hit_policy="any_occurrence",
     ),
     RuleCard(
-        key="upsell",
-        title_ru="Допродажа",
-        what_to_check="Есть ли в диалоге уместное предложение следующего платного шага.",
-        why_it_matters="Рост среднего чека без потери качества общения.",
+        key="next_step",
+        title_ru="Next step (CTA)",
+        what_to_check="Есть ли в диалоге явное предложение следующего действия: демо/созвон/тур/отправка материалов или другой конкретный CTA.",
+        why_it_matters="Ускоряет движение клиента по воронке и снижает вероятность потери диалога без продолжения.",
         evaluation_scope="conversation",
         seller_window_max=None,
         hit_policy="any_occurrence",
@@ -115,7 +117,7 @@ FIXED_SCAN_POLICY = ScanPolicy()
 # Бизнес-правила для оценки каждого диалога.
 RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
     "greeting": ("greeting_present", "greeting_missing", "greeting_late"),
-    "upsell": ("upsell_offer", "upsell_missing", "discount_without_upsell"),
+    "next_step": ("next_step_present", "next_step_missing", "cta_without_next_step"),
     "empathy": ("empathy_acknowledged", "courtesy_without_empathy", "informational_without_empathy"),
 }
 
@@ -123,9 +125,9 @@ RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
     "greeting": (
         "Приветствие после третьего seller-сообщения не засчитывается (reason_code=`greeting_late`).",
     ),
-    "upsell": (
-        "Скидка/промокод без новой опции не считается допродажей.",
-        "Статус/инфо-ответ без платного следующего шага не считается upsell.",
+    "next_step": (
+        "Скидка/промокод без явного следующего действия не считается CTA.",
+        "Статус/инфо-ответ без приглашения к следующему шагу не считается next_step.",
     ),
     "empathy": (
         "Вежливость и small talk не равны эмпатии.",
@@ -154,7 +156,7 @@ def quality_thresholds() -> QualityThresholds:
 
 
 def fixed_scan_policy() -> ScanPolicy:
-    """Возвращает фиксированную продуктовую scan-policy v5."""
+    """Возвращает фиксированную продуктовую scan-policy v6."""
 
     return FIXED_SCAN_POLICY
 

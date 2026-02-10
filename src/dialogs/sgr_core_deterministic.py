@@ -6,8 +6,8 @@ from collections.abc import Mapping, Sequence
 def reason_code_for_rule(rule_key: str, hit: bool) -> str:
     if rule_key == "greeting":
         return "greeting_present" if hit else "greeting_missing"
-    if rule_key == "upsell":
-        return "upsell_offer" if hit else "upsell_missing"
+    if rule_key == "next_step":
+        return "next_step_present" if hit else "next_step_missing"
     return "empathy_acknowledged" if hit else "informational_without_empathy"
 
 
@@ -16,9 +16,31 @@ def _is_greeting(text: str) -> bool:
     return "здрав" in low or "hello" in low
 
 
-def _is_upsell(text: str) -> bool:
+def _is_next_step(text: str) -> bool:
     low = text.lower()
-    return "пакет" in low or "plan" in low or "доп" in low
+    cta_markers = (
+        "demo",
+        "демо",
+        "созвон",
+        "call",
+        "meeting",
+        "встреч",
+        "тур",
+        "tour",
+        "материал",
+        "send you",
+        "отправ",
+        "next step",
+        "следующ",
+        "план",
+        "plan",
+        "пакет",
+        "package",
+        "доп",
+        "recommend",
+        "предлага",
+    )
+    return any(marker in low for marker in cta_markers)
 
 
 def _is_empathy(text: str) -> bool:
@@ -32,7 +54,7 @@ def rule_eval_for_dialog(
 ) -> tuple[bool, str, str, int | None, int | None]:
     matcher = {
         "greeting": _is_greeting,
-        "upsell": _is_upsell,
+        "next_step": _is_next_step,
         "empathy": _is_empathy,
     }.get(rule_key, lambda _text: False)
 

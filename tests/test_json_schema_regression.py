@@ -26,10 +26,10 @@ PARSER_CASES = [
                 "evidence_message_id": 11,
                 "evidence_message_order": 2,
             },
-            "upsell": {
+            "next_step": {
                 "hit": False,
                 "confidence": 0.7,
-                "reason_code": "upsell_missing",
+                "reason_code": "next_step_missing",
                 "reason": "Нет следующего шага",
                 "evidence_quote": "",
                 "evidence_message_id": None,
@@ -59,10 +59,10 @@ PARSER_CASES = [
                 "evidence_message_id": 11,
                 "evidence_message_order": 2,
             },
-            "upsell": {
+            "next_step": {
                 "hit": False,
                 "confidence": 0.7,
-                "reason_code": "upsell_missing",
+                "reason_code": "next_step_missing",
                 "reason": "Нет следующего шага",
                 "evidence_quote": "",
                 "evidence_message_id": None,
@@ -123,7 +123,7 @@ PARSER_CASES = [
         BUNDLED_JUDGE_MODEL,
         {
             "greeting": {"expected_hit": True, "label": True, "confidence": 0.9, "rationale": "ok"},
-            "upsell": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
+            "next_step": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
             "empathy": {"expected_hit": True, "label": True, "confidence": 0.8, "rationale": "ok"},
         },
         False,
@@ -132,7 +132,7 @@ PARSER_CASES = [
         BUNDLED_JUDGE_MODEL,
         {
             "greeting": {"expected_hit": True, "label": True, "confidence": 0.9},
-            "upsell": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
+            "next_step": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
             "empathy": {"expected_hit": True, "label": True, "confidence": 0.8, "rationale": "ok"},
         },
         True,

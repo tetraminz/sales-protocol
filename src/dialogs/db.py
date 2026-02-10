@@ -43,7 +43,7 @@ SCHEMA_DICTIONARY_RU: dict[str, dict[str, str]] = {
         "result_id": "Уникальный идентификатор результата.",
         "run_id": "Идентификатор запуска scan.",
         "conversation_id": "Идентификатор диалога результата.",
-        "rule_key": "Ключ проверяемого правила (greeting/upsell/empathy).",
+        "rule_key": "Ключ проверяемого правила (greeting/next_step/empathy).",
         "eval_hit": "Решение evaluator: найдено ли соблюдение правила.",
         "eval_confidence": "Уверенность evaluator в решении [0..1].",
         "eval_reason_code": "Код причины решения evaluator из фиксированного списка.",

@@ -169,15 +169,15 @@ class FakeLLM:
                     evidence_message_id=evidence_message_id,
                     evidence_message_order=evidence_message_order,
                 )
-            if self.mode == "quote_mismatch" and "upsell" in payload and payload["upsell"].hit:
-                payload["upsell"] = RuleEvaluation(
+            if self.mode == "quote_mismatch" and "next_step" in payload and payload["next_step"].hit:
+                payload["next_step"] = RuleEvaluation(
                     hit=True,
                     confidence=0.8,
-                    reason_code="upsell_offer",
+                    reason_code="next_step_present",
                     reason="ok",
                     evidence_quote="перефразированная цитата которой нет в seller_text",
-                    evidence_message_id=payload["upsell"].evidence_message_id,
-                    evidence_message_order=payload["upsell"].evidence_message_order,
+                    evidence_message_id=payload["next_step"].evidence_message_id,
+                    evidence_message_order=payload["next_step"].evidence_message_order,
                 )
             parsed = model_type.model_validate(payload)
             persist_call(error_message="", parse_ok=True, validation_ok=True, extracted_json=parsed.model_dump_json())
@@ -253,7 +253,7 @@ def csv_dir_late_greeting(tmp_path: Path) -> Path:
 
 def test_rules_are_exactly_three_hardcoded_dataset_style() -> None:
     keys = [rule.key for rule in all_rules()]
-    assert keys == ["greeting", "upsell", "empathy"]
+    assert keys == ["greeting", "next_step", "empathy"]
 
 
 def test_fixed_scan_policy_source_of_truth_dataset_style() -> None:

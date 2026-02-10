@@ -29,7 +29,7 @@
 - `src/dialogs/interfaces/` предоставляет стабильные точки входа `run_scan/build_report`;
 - `src/dialogs/pipeline.py` остается совместимым фасадом для legacy-импортов.
 
-## Judge Contract (v5)
+## Judge Contract (v6)
 
 Инварианты не меняются:
 - bundled evaluator + bundled judge на каждый диалог;
@@ -40,18 +40,20 @@
 ## Checklist: как добавить новое Rule
 
 1. Добавить `RuleCard` в `src/dialogs/sgr_core.py` (`RULES`).
-2. Добавить reason codes в `RULE_REASON_CODES` и антипаттерны в `RULE_ANTI_PATTERNS`.
-3. Проверить, что новый key автоматически попал в dynamic bundled schema (`judge.schema_factory`).
-4. Проверить фикстуры/fake LLM в тестах и `docs_refresh` (они должны брать ключи из `all_rules()`).
-5. Прогнать `make test && make docs`.
-6. Сверить, что `make scan` и `make report` сохранили прежний контракт и метрики.
+2. Добавить новый код в `ReasonCode` (`src/dialogs/models.py`).
+3. Добавить reason codes в `RULE_REASON_CODES` и антипаттерны в `RULE_ANTI_PATTERNS`.
+4. Проверить, что новый key автоматически попал в dynamic bundled schema (`judge.schema_factory`).
+5. Обновить deterministic/fake контуры в тестах и `docs_refresh` (они должны брать ключи из `all_rules()`).
+6. Если изменился публичный бизнес-термин/ключ, сделать version bump `METRICS_VERSION` в `sgr_core`.
+7. Прогнать `make test && make docs`.
+8. Сверить, что `make scan` и `make report` сохранили контракт и метрики.
 
 ## Мини-примеры
 
 Пример rule-driven judge schema:
-- вход: `rule_keys=("greeting", "upsell", "empathy")`
-- выход: strict bundled model с обязательными полями `greeting/upsell/empathy`.
+- вход: `rule_keys=("greeting", "next_step", "empathy")`
+- выход: strict bundled model с обязательными полями `greeting/next_step/empathy`.
 
 Пример расширения без ручной правки judge-кода:
-- вход: `rule_keys=("greeting", "upsell", "empathy", "next_step")`
-- выход: bundled schema автоматически включает поле `next_step`.
+- вход: `rule_keys=("greeting", "next_step", "empathy", "follow_up")`
+- выход: bundled schema автоматически включает поле `follow_up`.

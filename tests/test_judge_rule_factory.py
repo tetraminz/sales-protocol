@@ -32,16 +32,16 @@ def test_judge_schema_matches_current_rules() -> None:
 
 def test_judge_schema_supports_future_rule_without_manual_bundle_changes() -> None:
     base_keys = tuple(rule.key for rule in all_rules())
-    extended_keys = base_keys + ("next_step",)
+    extended_keys = base_keys + ("follow_up",)
 
     model = build_judge_bundle_model(extended_keys)
     schema = model.model_json_schema()
 
-    assert "next_step" in set((schema.get("properties") or {}).keys())
-    assert "next_step" in set(schema.get("required") or [])
+    assert "follow_up" in set((schema.get("properties") or {}).keys())
+    assert "follow_up" in set(schema.get("required") or [])
 
     parsed = model.model_validate(_judge_payload(extended_keys))
-    assert bool(getattr(parsed, "next_step").label) is True
+    assert bool(getattr(parsed, "follow_up").label) is True
 
 
 def test_judge_schema_requires_every_rule_field() -> None:
