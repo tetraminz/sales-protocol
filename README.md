@@ -72,8 +72,4 @@ Kernel: `Python (dialogs-sgr)`.
 8. [`docs/stability_case_review.md`](docs/stability_case_review.md)
 9. [`docs/judge_module.md`](docs/judge_module.md)
 
-## Глоссарий Метрик
 
-- `evaluator_hit_rate`: доля `eval_hit=1`.
-- `judge_correctness`: доля `judge_label=1` среди проверенных judge кейсов.
-- `judge_coverage`: доля проверенных judge кейсов среди всех eval-кейсов.
