@@ -11,6 +11,7 @@ import subprocess
 
 import pytest
 
+import dialogs.pipeline as pipeline_module
 from dialogs.cli import build_parser
 from dialogs.db import SCHEMA_DICTIONARY_RU, connect, get_state, init_db, schema_dictionary_missing_entries
 from dialogs.ingest import ingest_csv_dir
@@ -18,7 +19,8 @@ from dialogs.judge import build_evaluator_bundle_model
 from dialogs.llm import CallResult, LLMClient
 from dialogs.models import RuleEvaluation, RuleJudgeEvaluation
 from dialogs.pipeline import _build_accuracy_heatmap_data, _heatmap_zone, build_report, run_scan
-from dialogs.sgr_core import METRICS_VERSION, all_rules, quality_thresholds
+from dialogs.sgr_core import METRICS_VERSION, all_rules, fixed_scan_policy, quality_thresholds
+from dialogs.sgr_core_deterministic import rule_eval_for_dialog
 
 RULE_KEYS = tuple(rule.key for rule in all_rules())
 EVALUATOR_BUNDLE_MODEL = build_evaluator_bundle_model(RULE_KEYS)
@@ -33,58 +35,6 @@ def _extract_json_blob(text: str) -> dict[str, object]:
         return json.loads(text[start : end + 1])
     except Exception:
         return {}
-
-
-def _reason_code(rule_key: str, hit: bool) -> str:
-    if rule_key == "greeting":
-        return "greeting_present" if hit else "greeting_missing"
-    if rule_key == "upsell":
-        return "upsell_offer" if hit else "upsell_missing"
-    return "empathy_acknowledged" if hit else "informational_without_empathy"
-
-
-def _rule_eval_for_dialog(
-    rule_key: str,
-    seller_rows: list[dict[str, object]],
-) -> tuple[bool, str, str, int | None, int | None]:
-    def is_greeting(text: str) -> bool:
-        low = text.lower()
-        return "здрав" in low or "hello" in low
-
-    def is_upsell(text: str) -> bool:
-        low = text.lower()
-        return "пакет" in low or "plan" in low or "доп" in low
-
-    def is_empathy(text: str) -> bool:
-        low = text.lower()
-        return "понима" in low or "understand" in low
-
-    matcher = {
-        "greeting": is_greeting,
-        "upsell": is_upsell,
-        "empathy": is_empathy,
-    }.get(rule_key, lambda _text: False)
-
-    greeting_window = seller_rows[:3]
-
-    if rule_key == "greeting":
-        for row in greeting_window:
-            text = str(row["text"])
-            if matcher(text):
-                quote = text.split()[0] if text.split() else ""
-                return True, _reason_code(rule_key, True), quote, int(row["message_id"]), int(row["message_order"])
-        for row in seller_rows:
-            text = str(row["text"])
-            if matcher(text):
-                return False, "greeting_late", "", None, None
-        return False, _reason_code(rule_key, False), "", None, None
-
-    for row in seller_rows:
-        text = str(row["text"])
-        if matcher(text):
-            quote = text.split()[0] if text.split() else ""
-            return True, _reason_code(rule_key, True), quote, int(row["message_id"]), int(row["message_order"])
-    return False, _reason_code(rule_key, False), "", None, None
 
 
 class FakeLLM:
@@ -206,7 +156,7 @@ class FakeLLM:
             ]
             payload: dict[str, RuleEvaluation] = {}
             for rule_key in self.rule_keys:
-                hit, reason_code, evidence_quote, evidence_message_id, evidence_message_order = _rule_eval_for_dialog(
+                hit, reason_code, evidence_quote, evidence_message_id, evidence_message_order = rule_eval_for_dialog(
                     rule_key,
                     seller_rows,
                 )
@@ -304,6 +254,27 @@ def csv_dir_late_greeting(tmp_path: Path) -> Path:
 def test_rules_are_exactly_three_hardcoded_dataset_style() -> None:
     keys = [rule.key for rule in all_rules()]
     assert keys == ["greeting", "upsell", "empathy"]
+
+
+def test_fixed_scan_policy_source_of_truth_dataset_style() -> None:
+    policy = fixed_scan_policy()
+    assert policy.bundle_rules is True
+    assert policy.judge_mode == "full"
+    assert policy.context_mode == "full"
+    assert policy.llm_trace == "full"
+    assert policy.greeting_window_max == 3
+
+
+def test_pipeline_facade_exports_legacy_symbols_dataset_style() -> None:
+    assert callable(pipeline_module.run_scan)
+    assert callable(pipeline_module.build_report)
+    assert callable(pipeline_module._build_accuracy_heatmap_data)
+    assert callable(pipeline_module._heatmap_zone)
+    assert pipeline_module._heatmap_zone(None) == "na"
+    assert pipeline_module.run_scan is run_scan
+    assert pipeline_module.build_report is build_report
+    assert pipeline_module._build_accuracy_heatmap_data is _build_accuracy_heatmap_data
+    assert pipeline_module._heatmap_zone is _heatmap_zone
 
 
 def test_scan_default_range_first_five_dataset_style(db_path: Path, csv_dir: Path) -> None:

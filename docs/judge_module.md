@@ -21,7 +21,13 @@
 
 `sgr_core`:
 - источник истины по `RuleCard`, порогам и бизнес-контексту правил;
+- источник fixed scan-policy (`fixed_scan_policy`);
 - формирует evaluator prompt и контекст для judge.
+
+`infrastructure` + `interfaces`:
+- `src/dialogs/infrastructure/` исполняет scan/report orchestration и работу с артефактами;
+- `src/dialogs/interfaces/` предоставляет стабильные точки входа `run_scan/build_report`;
+- `src/dialogs/pipeline.py` остается совместимым фасадом для legacy-импортов.
 
 ## Judge Contract (v5)
 

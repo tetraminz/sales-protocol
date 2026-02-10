@@ -7,8 +7,8 @@ import sys
 
 from .db import connect, db_stats, init_db, reset_run_data
 from .ingest import ingest_csv_dir
+from .interfaces import build_report, run_scan
 from .llm import LLMClient
-from .pipeline import build_report, run_scan
 
 def _conn(db_path: str) -> sqlite3.Connection:
     return connect(db_path)
