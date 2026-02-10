@@ -39,18 +39,18 @@ SCHEMA_DICTIONARY_RU: dict[str, dict[str, str]] = {
         "summary_json": "Сводка counters и конфигурации запуска в JSON.",
     },
     "scan_results": {
-        "__table__": "Результаты проверки правила для seller-turn (одна строка = одно правило).",
+        "__table__": "Результаты проверки правила для диалога (одна строка = одно правило).",
         "result_id": "Уникальный идентификатор результата.",
         "run_id": "Идентификатор запуска scan.",
         "conversation_id": "Идентификатор диалога результата.",
-        "seller_message_id": "Идентификатор реплики продавца, которую оценивали.",
-        "customer_message_id": "Идентификатор последней релевантной реплики покупателя (может быть NULL).",
         "rule_key": "Ключ проверяемого правила (greeting/upsell/empathy).",
         "eval_hit": "Решение evaluator: найдено ли соблюдение правила.",
         "eval_confidence": "Уверенность evaluator в решении [0..1].",
         "eval_reason_code": "Код причины решения evaluator из фиксированного списка.",
         "eval_reason": "Текстовое объяснение evaluator на русском языке.",
-        "evidence_quote": "Дословная цитата из реплики продавца как evidence.",
+        "evidence_quote": "Дословная цитата из anchor-реплики продавца как evidence.",
+        "evidence_message_id": "Идентификатор anchor-реплики продавца для evidence (может быть NULL при eval_hit=0).",
+        "evidence_message_order": "Порядок anchor-реплики продавца в диалоге (может быть NULL при eval_hit=0).",
         "judge_expected_hit": "Ожидание judge о корректном hit для кейса.",
         "judge_label": "Вердикт judge о корректности evaluator (1/0).",
         "judge_confidence": "Уверенность judge в вердикте [0..1].",
@@ -79,7 +79,7 @@ SCHEMA_DICTIONARY_RU: dict[str, dict[str, str]] = {
         "phase": "Фаза вызова (evaluator/judge).",
         "rule_key": "Ключ правила или bundle.",
         "conversation_id": "Идентификатор диалога вызова.",
-        "message_id": "Идентификатор seller_message_id вызова.",
+        "message_id": "Опорный message_id вызова внутри conversation_id (в dialog-level режиме обычно первый seller message_id).",
         "attempt": "Номер попытки вызова.",
         "context_mode": "Политика контекста в продукте (в v3 всегда full).",
         "judge_policy": "Политика judge в продукте (в v3 всегда full coverage).",
@@ -146,24 +146,23 @@ CREATE TABLE IF NOT EXISTS scan_results (
   result_id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL,
   conversation_id TEXT NOT NULL,
-  seller_message_id INTEGER NOT NULL,
-  customer_message_id INTEGER,
   rule_key TEXT NOT NULL,
   eval_hit INTEGER NOT NULL,
   eval_confidence REAL NOT NULL,
   eval_reason_code TEXT NOT NULL,
   eval_reason TEXT NOT NULL,
   evidence_quote TEXT NOT NULL,
+  evidence_message_id INTEGER,
+  evidence_message_order INTEGER,
   judge_expected_hit INTEGER,
   judge_label INTEGER,
   judge_confidence REAL,
   judge_rationale TEXT,
   created_at_utc TEXT NOT NULL,
   updated_at_utc TEXT NOT NULL,
-  UNIQUE(run_id, seller_message_id, rule_key),
+  UNIQUE(run_id, conversation_id, rule_key),
   FOREIGN KEY(run_id) REFERENCES scan_runs(run_id),
-  FOREIGN KEY(seller_message_id) REFERENCES messages(message_id),
-  FOREIGN KEY(customer_message_id) REFERENCES messages(message_id)
+  FOREIGN KEY(evidence_message_id) REFERENCES messages(message_id)
 );
 
 CREATE TABLE IF NOT EXISTS scan_metrics (
@@ -214,7 +213,7 @@ CREATE TABLE IF NOT EXISTS app_state (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(conversation_id, message_order);
 CREATE INDEX IF NOT EXISTS idx_scan_results_run_rule ON scan_results(run_id, rule_key);
-CREATE INDEX IF NOT EXISTS idx_scan_results_run_seller ON scan_results(run_id, seller_message_id);
+CREATE INDEX IF NOT EXISTS idx_scan_results_run_conversation ON scan_results(run_id, conversation_id);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run_phase ON llm_calls(run_id, phase);
 """
 
