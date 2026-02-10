@@ -14,10 +14,14 @@ import pytest
 from dialogs.cli import build_parser
 from dialogs.db import SCHEMA_DICTIONARY_RU, connect, get_state, init_db, schema_dictionary_missing_entries
 from dialogs.ingest import ingest_csv_dir
+from dialogs.judge import build_evaluator_bundle_model
 from dialogs.llm import CallResult, LLMClient
-from dialogs.models import BundledEvaluatorResult, BundledJudgeResult, RuleEvaluation, RuleJudgeEvaluation
+from dialogs.models import RuleEvaluation, RuleJudgeEvaluation
 from dialogs.pipeline import _build_accuracy_heatmap_data, _heatmap_zone, build_report, run_scan
 from dialogs.sgr_core import METRICS_VERSION, all_rules, quality_thresholds
+
+RULE_KEYS = tuple(rule.key for rule in all_rules())
+EVALUATOR_BUNDLE_MODEL = build_evaluator_bundle_model(RULE_KEYS)
 
 
 def _extract_json_blob(text: str) -> dict[str, object]:
@@ -84,9 +88,10 @@ def _rule_eval_for_dialog(
 
 
 class FakeLLM:
-    def __init__(self, mode: str = "ok") -> None:
+    def __init__(self, mode: str = "ok", *, rule_keys: tuple[str, ...] | None = None) -> None:
         self.model = "fake-model"
         self.mode = mode
+        self.rule_keys = tuple(rule_keys or RULE_KEYS)
         self.calls = 0
         self.evaluator_calls = 0
         self.judge_calls = 0
@@ -181,7 +186,7 @@ class FakeLLM:
                 is_live_error=True,
             )
 
-        if model_type is BundledEvaluatorResult:
+        if phase == "evaluator":
             rows = conn.execute(
                 """
                 SELECT message_id, message_order, text
@@ -199,8 +204,8 @@ class FakeLLM:
                 }
                 for row in rows
             ]
-            payload = {}
-            for rule_key in ("greeting", "upsell", "empathy"):
+            payload: dict[str, RuleEvaluation] = {}
+            for rule_key in self.rule_keys:
                 hit, reason_code, evidence_quote, evidence_message_id, evidence_message_order = _rule_eval_for_dialog(
                     rule_key,
                     seller_rows,
@@ -214,7 +219,7 @@ class FakeLLM:
                     evidence_message_id=evidence_message_id,
                     evidence_message_order=evidence_message_order,
                 )
-            if payload["upsell"].hit and self.mode == "quote_mismatch":
+            if self.mode == "quote_mismatch" and "upsell" in payload and payload["upsell"].hit:
                 payload["upsell"] = RuleEvaluation(
                     hit=True,
                     confidence=0.8,
@@ -224,17 +229,17 @@ class FakeLLM:
                     evidence_message_id=payload["upsell"].evidence_message_id,
                     evidence_message_order=payload["upsell"].evidence_message_order,
                 )
-            parsed = BundledEvaluatorResult(**payload)
+            parsed = model_type.model_validate(payload)
             persist_call(error_message="", parse_ok=True, validation_ok=True, extracted_json=parsed.model_dump_json())
             return CallResult(parsed, True, True, "", False, False)
 
-        if model_type is BundledJudgeResult:
+        if phase == "judge":
             evaluator_text = user_prompt.partition("Ответ evaluator (JSON):")[2].strip()
             evaluator_payload = json.loads(evaluator_text) if evaluator_text else {}
-            evaluator = BundledEvaluatorResult.model_validate(evaluator_payload)
             out: dict[str, RuleJudgeEvaluation] = {}
-            for rule_key in ("greeting", "upsell", "empathy"):
-                eval_hit = bool(getattr(evaluator, rule_key).hit)
+            for rule_key in self.rule_keys:
+                eval_row = evaluator_payload.get(rule_key, {})
+                eval_hit = bool(eval_row.get("hit")) if isinstance(eval_row, dict) else False
                 expected = eval_hit
                 if self.mode == "regress" and rule_key == "greeting":
                     expected = not expected
@@ -245,7 +250,7 @@ class FakeLLM:
                     confidence=0.75,
                     rationale="ok",
                 )
-            parsed = BundledJudgeResult(**out)
+            parsed = model_type.model_validate(out)
             persist_call(error_message="", parse_ok=True, validation_ok=True, extracted_json=parsed.model_dump_json())
             return CallResult(parsed, True, True, "", False, False)
 
@@ -627,7 +632,7 @@ def test_llm_call_always_persists_full_trace_dataset_style(db_path: Path) -> Non
             rule_key="bundle",
             conversation_id="conv_x",
             message_id=1,
-            model_type=BundledEvaluatorResult,
+            model_type=EVALUATOR_BUNDLE_MODEL,
             system_prompt="system",
             user_prompt="user",
             attempt=1,
@@ -718,6 +723,7 @@ def test_doc_contract_files_exist_dataset_style() -> None:
         Path("artifacts/accuracy_diff.png"),
         Path("Makefile"),
         Path("docs/stability_case_review.md"),
+        Path("docs/judge_module.md"),
     ]
     missing = [str(path) for path in required if not path.exists()]
     assert not missing, f"missing doc-contract files: {missing}"

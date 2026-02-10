@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from dialogs.models import BundledEvaluatorResult, BundledJudgeResult, RuleEvaluation, RuleJudgeEvaluation
+from dialogs.judge.schema_factory import build_evaluator_bundle_model, build_judge_bundle_model
+from dialogs.models import RuleEvaluation, RuleJudgeEvaluation
+from dialogs.sgr_core import all_rules
 
-STRICT_SCHEMA_CASES = [RuleEvaluation, BundledEvaluatorResult, RuleJudgeEvaluation, BundledJudgeResult]
+RULE_KEYS = tuple(rule.key for rule in all_rules())
+BUNDLED_EVALUATOR_MODEL = build_evaluator_bundle_model(RULE_KEYS)
+BUNDLED_JUDGE_MODEL = build_judge_bundle_model(RULE_KEYS)
+
+STRICT_SCHEMA_CASES = [RuleEvaluation, BUNDLED_EVALUATOR_MODEL, RuleJudgeEvaluation, BUNDLED_JUDGE_MODEL]
 
 
 PARSER_CASES = [
     (
-        BundledEvaluatorResult,
+        BUNDLED_EVALUATOR_MODEL,
         {
             "greeting": {
                 "hit": True,
@@ -42,7 +48,7 @@ PARSER_CASES = [
         False,
     ),
     (
-        BundledEvaluatorResult,
+        BUNDLED_EVALUATOR_MODEL,
         {
             "greeting": {
                 "hit": True,
@@ -114,7 +120,7 @@ PARSER_CASES = [
         True,
     ),
     (
-        BundledJudgeResult,
+        BUNDLED_JUDGE_MODEL,
         {
             "greeting": {"expected_hit": True, "label": True, "confidence": 0.9, "rationale": "ok"},
             "upsell": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},
@@ -123,7 +129,7 @@ PARSER_CASES = [
         False,
     ),
     (
-        BundledJudgeResult,
+        BUNDLED_JUDGE_MODEL,
         {
             "greeting": {"expected_hit": True, "label": True, "confidence": 0.9},
             "upsell": {"expected_hit": False, "label": True, "confidence": 0.7, "rationale": "ok"},

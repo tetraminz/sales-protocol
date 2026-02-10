@@ -26,6 +26,13 @@
 
 Этот порядок не настраивается.
 
+## Архитектурные Слои
+
+- `src/dialogs/sgr_core.py`: бизнес-ядро правил (`Rule`), бизнес-порогов и evaluator prompt.
+- `src/dialogs/judge/`: независимый judge-слой (schema factory, prompt builder, rule-key mapping).
+- `src/dialogs/pipeline.py`: orchestration scan/report без изменения бизнес-семантики метрик.
+- `docs/judge_module.md`: практическая документация judge-слоя и checklist добавления нового Rule.
+
 ## Быстрый Запуск
 
 ```bash
@@ -61,6 +68,7 @@ Kernel: `Python (dialogs-sgr)`.
 6. [`artifacts/accuracy_diff.png`](artifacts/accuracy_diff.png)
 7. [`Makefile`](Makefile)
 8. [`docs/stability_case_review.md`](docs/stability_case_review.md)
+9. [`docs/judge_module.md`](docs/judge_module.md)
 
 ## Глоссарий Метрик
 
