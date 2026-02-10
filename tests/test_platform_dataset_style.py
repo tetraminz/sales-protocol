@@ -39,18 +39,48 @@ def _reason_code(rule_key: str, hit: bool) -> str:
     return "empathy_acknowledged" if hit else "informational_without_empathy"
 
 
-def _eval_rule(rule_key: str, text: str, customer_text: str) -> tuple[bool, str]:
-    low = text.lower()
+def _rule_eval_for_dialog(
+    rule_key: str,
+    seller_rows: list[dict[str, object]],
+) -> tuple[bool, str, str, int | None, int | None]:
+    def is_greeting(text: str) -> bool:
+        low = text.lower()
+        return "здрав" in low or "hello" in low
+
+    def is_upsell(text: str) -> bool:
+        low = text.lower()
+        return "пакет" in low or "plan" in low or "доп" in low
+
+    def is_empathy(text: str) -> bool:
+        low = text.lower()
+        return "понима" in low or "understand" in low
+
+    matcher = {
+        "greeting": is_greeting,
+        "upsell": is_upsell,
+        "empathy": is_empathy,
+    }.get(rule_key, lambda _text: False)
+
+    greeting_window = seller_rows[:3]
+
     if rule_key == "greeting":
-        hit = "здрав" in low or "hello" in low
-    elif rule_key == "upsell":
-        hit = "пакет" in low or "plan" in low or "доп" in low
-    elif rule_key == "empathy":
-        hit = ("понима" in low or "understand" in low) and bool(customer_text.strip())
-    else:
-        hit = False
-    evidence = text.split()[0] if hit and text.split() else ""
-    return hit, evidence
+        for row in greeting_window:
+            text = str(row["text"])
+            if matcher(text):
+                quote = text.split()[0] if text.split() else ""
+                return True, _reason_code(rule_key, True), quote, int(row["message_id"]), int(row["message_order"])
+        for row in seller_rows:
+            text = str(row["text"])
+            if matcher(text):
+                return False, "greeting_late", "", None, None
+        return False, _reason_code(rule_key, False), "", None, None
+
+    for row in seller_rows:
+        text = str(row["text"])
+        if matcher(text):
+            quote = text.split()[0] if text.split() else ""
+            return True, _reason_code(rule_key, True), quote, int(row["message_id"]), int(row["message_order"])
+    return False, _reason_code(rule_key, False), "", None, None
 
 
 class FakeLLM:
@@ -152,19 +182,37 @@ class FakeLLM:
             )
 
         if model_type is BundledEvaluatorResult:
-            seller_text = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0])
-            customer_line = next((line for line in user_prompt.splitlines() if line.startswith("customer_text=")), "")
-            customer_text = customer_line.partition("=")[2]
-
+            rows = conn.execute(
+                """
+                SELECT message_id, message_order, text
+                FROM messages
+                WHERE conversation_id=? AND speaker_label='Sales Rep'
+                ORDER BY message_order
+                """,
+                (conversation_id,),
+            ).fetchall()
+            seller_rows = [
+                {
+                    "message_id": int(row["message_id"]),
+                    "message_order": int(row["message_order"]),
+                    "text": str(row["text"]),
+                }
+                for row in rows
+            ]
             payload = {}
             for rule_key in ("greeting", "upsell", "empathy"):
-                hit, evidence_quote = _eval_rule(rule_key, seller_text, customer_text)
+                hit, reason_code, evidence_quote, evidence_message_id, evidence_message_order = _rule_eval_for_dialog(
+                    rule_key,
+                    seller_rows,
+                )
                 payload[rule_key] = RuleEvaluation(
                     hit=hit,
                     confidence=0.8,
-                    reason_code=_reason_code(rule_key, hit),
+                    reason_code=reason_code,
                     reason="ok",
                     evidence_quote=evidence_quote,
+                    evidence_message_id=evidence_message_id,
+                    evidence_message_order=evidence_message_order,
                 )
             if payload["upsell"].hit and self.mode == "quote_mismatch":
                 payload["upsell"] = RuleEvaluation(
@@ -173,13 +221,16 @@ class FakeLLM:
                     reason_code="upsell_offer",
                     reason="ok",
                     evidence_quote="перефразированная цитата которой нет в seller_text",
+                    evidence_message_id=payload["upsell"].evidence_message_id,
+                    evidence_message_order=payload["upsell"].evidence_message_order,
                 )
             parsed = BundledEvaluatorResult(**payload)
             persist_call(error_message="", parse_ok=True, validation_ok=True, extracted_json=parsed.model_dump_json())
             return CallResult(parsed, True, True, "", False, False)
 
         if model_type is BundledJudgeResult:
-            evaluator_payload = _extract_json_blob(user_prompt)
+            evaluator_text = user_prompt.partition("Ответ evaluator (JSON):")[2].strip()
+            evaluator_payload = json.loads(evaluator_text) if evaluator_text else {}
             evaluator = BundledEvaluatorResult.model_validate(evaluator_payload)
             out: dict[str, RuleJudgeEvaluation] = {}
             for rule_key in ("greeting", "upsell", "empathy"):
@@ -225,6 +276,26 @@ def csv_dir(tmp_path: Path) -> Path:
     return directory
 
 
+@pytest.fixture()
+def csv_dir_late_greeting(tmp_path: Path) -> Path:
+    directory = tmp_path / "csv_late_greeting"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "conv_late.csv"
+    header = ["Conversation", "Chunk_id", "Speaker", "Text", "Embedding"]
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerow(["conv_late", 1, "Customer", "Нужна помощь с тарифом", "[]"])
+        writer.writerow(["conv_late", 2, "Sales Rep", "Сейчас посмотрю детали вашего запроса", "[]"])
+        writer.writerow(["conv_late", 3, "Customer", "Хочу вариант подешевле", "[]"])
+        writer.writerow(["conv_late", 4, "Sales Rep", "Есть пакет Start", "[]"])
+        writer.writerow(["conv_late", 5, "Customer", "А что еще есть?", "[]"])
+        writer.writerow(["conv_late", 6, "Sales Rep", "Могу предложить пакет Plus", "[]"])
+        writer.writerow(["conv_late", 7, "Customer", "Ок", "[]"])
+        writer.writerow(["conv_late", 8, "Sales Rep", "Здравствуйте, спасибо за ожидание", "[]"])
+    return directory
+
+
 def test_rules_are_exactly_three_hardcoded_dataset_style() -> None:
     keys = [rule.key for rule in all_rules()]
     assert keys == ["greeting", "upsell", "empathy"]
@@ -241,6 +312,7 @@ def test_scan_default_range_first_five_dataset_style(db_path: Path, csv_dir: Pat
             "SELECT DISTINCT conversation_id FROM scan_results WHERE run_id=? ORDER BY conversation_id",
             (run_id,),
         ).fetchall()
+        total = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
 
     assert summary["selected_conversations"] == 5
     assert summary["conversation_from"] == 0
@@ -251,27 +323,37 @@ def test_scan_default_range_first_five_dataset_style(db_path: Path, csv_dir: Pat
     assert summary["context_mode"] == "full"
     assert summary["llm_trace"] == "full"
     assert summary["metrics_version"] == METRICS_VERSION
+    assert int(summary["evaluated_conversations"]) == 5
+    assert int(summary["skipped_conversations_without_seller"]) == 0
+    assert total == 15
+    assert fake.calls == 10
     assert [row[0] for row in convs] == ["conv_00", "conv_01", "conv_02", "conv_03", "conv_04"]
     assert set(fake.context_modes) == {"full"}
 
 
-def test_scan_stores_turn_pair_ids_dataset_style(db_path: Path, csv_dir: Path) -> None:
+def test_scan_stores_conversation_rule_rows_dataset_style(db_path: Path, csv_dir: Path) -> None:
     init_db(str(db_path))
     with connect(str(db_path)) as conn:
         ingest_csv_dir(conn, str(csv_dir), replace=True)
         run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=1)
-        missing_customer = int(
+        hit_without_anchor = int(
             conn.execute(
-                "SELECT COUNT(*) FROM scan_results WHERE run_id=? AND customer_message_id IS NULL",
+                """
+                SELECT COUNT(*)
+                FROM scan_results
+                WHERE run_id=?
+                  AND eval_hit=1
+                  AND (evidence_message_id IS NULL OR evidence_message_order IS NULL)
+                """,
                 (run_id,),
             ).fetchone()[0]
         )
-        unique_turn_rules = int(
+        unique_conversation_rules = int(
             conn.execute(
                 """
                 SELECT COUNT(*)
                 FROM (
-                  SELECT DISTINCT run_id, seller_message_id, rule_key
+                  SELECT DISTINCT run_id, conversation_id, rule_key
                   FROM scan_results
                   WHERE run_id=?
                 )
@@ -281,8 +363,53 @@ def test_scan_stores_turn_pair_ids_dataset_style(db_path: Path, csv_dir: Path) -
         )
         total = int(conn.execute("SELECT COUNT(*) FROM scan_results WHERE run_id=?", (run_id,)).fetchone()[0])
 
-    assert missing_customer == 0
-    assert unique_turn_rules == total
+    assert hit_without_anchor == 0
+    assert unique_conversation_rules == total
+    assert total == 6
+
+
+def test_greeting_hit_in_first_three_seller_messages_dataset_style(db_path: Path, csv_dir: Path) -> None:
+    init_db(str(db_path))
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir), replace=True)
+        run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=0)
+        row = conn.execute(
+            """
+            SELECT eval_hit, eval_reason_code, evidence_message_id, evidence_message_order, evidence_quote
+            FROM scan_results
+            WHERE run_id=? AND conversation_id='conv_00' AND rule_key='greeting'
+            """,
+            (run_id,),
+        ).fetchone()
+
+    assert row is not None
+    assert int(row["eval_hit"]) == 1
+    assert str(row["eval_reason_code"]) == "greeting_present"
+    assert int(row["evidence_message_order"]) <= 3
+    assert int(row["evidence_message_id"]) > 0
+    assert str(row["evidence_quote"]).strip() != ""
+
+
+def test_greeting_late_is_not_counted_dataset_style(db_path: Path, csv_dir_late_greeting: Path) -> None:
+    init_db(str(db_path))
+    with connect(str(db_path)) as conn:
+        ingest_csv_dir(conn, str(csv_dir_late_greeting), replace=True)
+        run_id = run_scan(conn, llm=FakeLLM("ok"), conversation_from=0, conversation_to=0)
+        row = conn.execute(
+            """
+            SELECT eval_hit, eval_reason_code, evidence_message_id, evidence_message_order, evidence_quote
+            FROM scan_results
+            WHERE run_id=? AND conversation_id='conv_late' AND rule_key='greeting'
+            """,
+            (run_id,),
+        ).fetchone()
+
+    assert row is not None
+    assert int(row["eval_hit"]) == 0
+    assert str(row["eval_reason_code"]) == "greeting_late"
+    assert row["evidence_message_id"] is None
+    assert row["evidence_message_order"] is None
+    assert str(row["evidence_quote"]) == ""
 
 
 def test_judge_full_coverage_default_dataset_style(db_path: Path, csv_dir: Path) -> None:
@@ -341,10 +468,10 @@ def test_call_reduction_vs_legacy_estimate_dataset_style(db_path: Path, csv_dir:
         run_id = run_scan(conn, llm=fake, conversation_from=0, conversation_to=1)
         summary = json.loads(conn.execute("SELECT summary_json FROM scan_runs WHERE run_id=?", (run_id,)).fetchone()[0])
 
-    seller_turns = int(summary["seller_turns"])
+    evaluated_conversations = int(summary["evaluated_conversations"])
     llm_calls = int(fake.calls)
-    assert llm_calls == seller_turns * 2
-    legacy_calls = seller_turns * 6
+    assert llm_calls == evaluated_conversations * 2
+    legacy_calls = evaluated_conversations * 6
     reduction = 1.0 - (float(llm_calls) / float(legacy_calls))
     assert reduction >= 0.60
 
@@ -444,7 +571,7 @@ def test_report_generation_contains_new_sections_dataset_style(
     assert png_path.exists()
     assert "## Rule Metrics" in md_text
     assert "judge_coverage_target" in md_text
-    assert "seller_message_id" in md_text
+    assert "evidence_message_id" in md_text
 
 
 def test_report_metrics_align_with_scan_metrics_dataset_style(

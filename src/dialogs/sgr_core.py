@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Core SGR-логика для оценки качества реплик продаж.
+"""Core SGR-логика для dialog-level оценки качества продаж.
 
 Роль модуля в пайплайне:
 - задает стабильный бизнес-контракт правил (`greeting`, `upsell`, `empathy`);
@@ -16,20 +16,27 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 import json
+from typing import Literal
 
 from .models import BundledEvaluatorResult, BundledJudgeResult, ReasonCode, RuleEvaluation, RuleJudgeEvaluation
 
-METRICS_VERSION = "v4_bundled_full_judge"
+METRICS_VERSION = "v5_dialog_level_bundle"
+
+EvaluationScope = Literal["conversation"]
+HitPolicy = Literal["any_occurrence"]
 
 
 @dataclass(frozen=True)
 class RuleCard:
-    """Карточка бизнес-правила оценки реплики продавца."""
+    """Карточка бизнес-правила dialog-level оценки."""
 
     key: str
     title_ru: str
     what_to_check: str
     why_it_matters: str
+    evaluation_scope: EvaluationScope
+    seller_window_max: int | None
+    hit_policy: HitPolicy
 
 
 @dataclass(frozen=True)
@@ -42,38 +49,58 @@ class QualityThresholds:
     judge_coverage_min: float = 1.0
 
 
+@dataclass(frozen=True)
+class SellerMessageRef:
+    """Ссылка на seller-сообщение в рамках диалога."""
+
+    message_id: int
+    message_order: int
+    text: str
+
+
 RULES: tuple[RuleCard, ...] = (
     RuleCard(
         key="greeting",
         title_ru="Приветствие",
-        what_to_check="Есть в реплике продавца явное приветствие клиенту.",
+        what_to_check="Есть ли приветствие в первых трех сообщениях продавца.",
         why_it_matters="Первое касание задает тон и влияет на доверие.",
+        evaluation_scope="conversation",
+        seller_window_max=3,
+        hit_policy="any_occurrence",
     ),
     RuleCard(
         key="upsell",
         title_ru="Допродажа",
-        what_to_check="Есть уместное предложение следующего платного шага.",
+        what_to_check="Есть ли в диалоге уместное предложение следующего платного шага.",
         why_it_matters="Рост среднего чека без потери качества общения.",
+        evaluation_scope="conversation",
+        seller_window_max=None,
+        hit_policy="any_occurrence",
     ),
     RuleCard(
         key="empathy",
         title_ru="Эмпатия",
-        what_to_check="В контексте есть явное признание ситуации клиента.",
+        what_to_check="Есть ли в диалоге явное признание ситуации клиента.",
         why_it_matters="Снижает трение и повышает шанс конструктивного ответа клиента.",
+        evaluation_scope="conversation",
+        seller_window_max=None,
+        hit_policy="any_occurrence",
     ),
 )
 
-# Централизованные пороги для heatmap/report.
 QUALITY_THRESHOLDS = QualityThresholds()
 
-# Бизнес-правила для оценки каждой реплики продавца.
+# Бизнес-правила для оценки каждого диалога.
 RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
-    "greeting": ("greeting_present", "greeting_missing"),
+    "greeting": ("greeting_present", "greeting_missing", "greeting_late"),
     "upsell": ("upsell_offer", "upsell_missing", "discount_without_upsell"),
     "empathy": ("empathy_acknowledged", "courtesy_without_empathy", "informational_without_empathy"),
 }
 
 RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
+    "greeting": (
+        "Приветствие после третьего seller-сообщения не засчитывается (reason_code=`greeting_late`).",
+    ),
     "upsell": (
         "Скидка/промокод без новой опции не считается допродажей.",
         "Статус/инфо-ответ без платного следующего шага не считается upsell.",
@@ -145,65 +172,52 @@ def _ordered_messages(conversation_messages: Sequence[object]) -> list[object]:
     return sorted(conversation_messages, key=lambda item: int(item["message_order"]))  # type: ignore[index]
 
 
-# Блок построения контекста вокруг текущей seller-реплики.
-def previous_customer_message(
-    conversation_messages: Sequence[object], *, current_message_order: int
-) -> object | None:
-    """Возвращает ближайшую предыдущую реплику покупателя перед текущей seller-репликой."""
+def seller_message_refs(conversation_messages: Sequence[object]) -> list[SellerMessageRef]:
+    """Собирает seller-сообщения диалога с id/order/text."""
 
-    candidate: object | None = None
+    refs: list[SellerMessageRef] = []
     for item in _ordered_messages(conversation_messages):
-        order = int(item["message_order"])  # type: ignore[index]
-        if order >= int(current_message_order):
-            break
-        if is_customer_message(str(item["speaker_label"])):  # type: ignore[index]
-            candidate = item
-    return candidate
+        if not is_seller_message(str(item["speaker_label"])):  # type: ignore[index]
+            continue
+        refs.append(
+            SellerMessageRef(
+                message_id=int(item["message_id"]),  # type: ignore[index]
+                message_order=int(item["message_order"]),  # type: ignore[index]
+                text=str(item["text"]),  # type: ignore[index]
+            )
+        )
+    return refs
+
+
+def greeting_window_refs(
+    conversation_messages: Sequence[object],
+    *,
+    max_messages: int = 3,
+) -> list[SellerMessageRef]:
+    """Возвращает seller-сообщения, попадающие в окно greeting."""
+
+    return seller_message_refs(conversation_messages)[: max(0, int(max_messages))]
 
 
 def build_chat_context(
     conversation_messages: Sequence[object],
     *,
-    current_message_order: int,
     mode: str = "full",
 ) -> str:
-    """Собирает контекст для evaluator/judge.
+    """Собирает контекст диалога для evaluator/judge.
 
-    - `full`: все сообщения до текущего включительно.
-    - `turn`: последняя реплика Customer + текущая реплика Sales Rep.
+    Поддерживается только `full`: все сообщения диалога по порядку.
     """
 
-    if mode not in {"full", "turn"}:
+    if mode != "full":
         raise ValueError(f"unknown context mode: {mode}")
 
-    ordered = _ordered_messages(conversation_messages)
-    if mode == "full":
-        lines: list[str] = []
-        for item in ordered:
-            order = int(item["message_order"])  # type: ignore[index]
-            if order > int(current_message_order):
-                continue
-            speaker = str(item["speaker_label"])  # type: ignore[index]
-            text = str(item["text"])  # type: ignore[index]
-            lines.append(f"[{order}] {speaker}: {text}")
-        return "\n".join(lines)
-
-    seller_item = None
-    for item in ordered:
-        if int(item["message_order"]) == int(current_message_order):  # type: ignore[index]
-            seller_item = item
-            break
-    if seller_item is None:
-        raise ValueError(f"current_message_order not found: {current_message_order}")
-
-    previous_customer = previous_customer_message(
-        ordered,
-        current_message_order=int(current_message_order),
-    )
-    lines = []
-    if previous_customer is not None:
-        lines.append(f"Customer: {str(previous_customer['text'])}")  # type: ignore[index]
-    lines.append(f"Sales Rep: {str(seller_item['text'])}")  # type: ignore[index]
+    lines: list[str] = []
+    for item in _ordered_messages(conversation_messages):
+        order = int(item["message_order"])  # type: ignore[index]
+        speaker = str(item["speaker_label"])  # type: ignore[index]
+        text = str(item["text"])  # type: ignore[index]
+        lines.append(f"[{order}] {speaker}: {text}")
     return "\n".join(lines)
 
 
@@ -220,39 +234,69 @@ def _anti_patterns_for_rule(rule_key: str) -> str:
     return "\n".join(f"- {item}" for item in values)
 
 
+def _seller_catalog_json(seller_catalog: Sequence[SellerMessageRef]) -> str:
+    payload = [
+        {
+            "message_id": int(item.message_id),
+            "message_order": int(item.message_order),
+            "text": str(item.text),
+        }
+        for item in seller_catalog
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _seller_catalog_copy_blocks(seller_catalog: Sequence[SellerMessageRef]) -> str:
+    lines: list[str] = []
+    for item in seller_catalog:
+        lines.extend(
+            [
+                f"ANCHOR message_id={int(item.message_id)} message_order={int(item.message_order)}",
+                "BEGIN_ANCHOR_TEXT",
+                str(item.text),
+                "END_ANCHOR_TEXT",
+            ]
+        )
+    return "\n".join(lines)
+
+
 # Блок сборки prompt-ов evaluator/judge.
 def build_evaluator_prompts_bundle(
     rules: Sequence[RuleCard],
     *,
-    seller_message_id: int,
-    seller_text: str,
-    customer_text: str,
+    conversation_id: str,
     chat_context: str,
+    seller_catalog: Sequence[SellerMessageRef],
+    greeting_window_max: int,
     context_mode: str,
 ) -> tuple[str, str]:
-    """Формирует bundled-prompt evaluator: один вызов на реплику, все правила сразу."""
+    """Формирует bundled-prompt evaluator: один вызов на диалог, все правила сразу."""
 
-    # Quote-contract: это обязательное бизнес-условие доказуемости.
-    # Для hit=true evaluator обязан вернуть не смысловой пересказ, а буквальный фрагмент seller_text.
     system_prompt = (
         "Ты evaluator качества продаж. "
         "Верни только JSON по схеме BundledEvaluatorResult. "
-        "Оцени greeting/upsell/empathy отдельно. "
+        "Оцени greeting/upsell/empathy отдельно на уровне всего диалога. "
         "reason пиши на русском. "
-        "Quote-contract обязателен: evidence_quote для hit=true должен быть дословной непустой "
-        "contiguous подстрокой seller_text, символ-в-символ, на том же языке. "
-        "Нельзя переводить, перефразировать, менять пунктуацию и кавычки. "
-        "Для hit=false допускается пустой evidence_quote."
+        "Quote-contract обязателен: для hit=true evidence_quote должен быть дословной непустой "
+        "contiguous подстрокой anchor seller-сообщения, символ-в-символ и на том же языке. "
+        "Anchor задается полями evidence_message_id и evidence_message_order. "
+        "При hit=false evidence_quote может быть пустым, а anchor-поля должны быть null. "
+        "Запрещено изменять регистр, пунктуацию, кавычки, апострофы, диакритику и пробелы внутри evidence_quote. "
+        "Запрещено сокращать цитату многоточием, пересказывать, переводить или нормализовать символы."
     )
 
     lines = [
-        f"seller_message_id={int(seller_message_id)}",
+        f"conversation_id={conversation_id}",
         f"context_mode={context_mode}",
-        f"customer_text={customer_text}",
-        "BEGIN_SELLER_TEXT",
-        seller_text,
-        "END_SELLER_TEXT",
-        "Контекст чата до текущей реплики:",
+        f"greeting_window_max={int(greeting_window_max)}",
+        "BEGIN_SELLER_CATALOG_JSON",
+        _seller_catalog_json(seller_catalog),
+        "END_SELLER_CATALOG_JSON",
+        "Каталог anchor-сообщений для точного COPY-PASTE:",
+        "BEGIN_SELLER_ANCHOR_BLOCKS",
+        _seller_catalog_copy_blocks(seller_catalog),
+        "END_SELLER_ANCHOR_BLOCKS",
+        "Контекст чата:",
         chat_context,
         "",
         "Правила для оценки:",
@@ -261,6 +305,9 @@ def build_evaluator_prompts_bundle(
         lines.extend(
             [
                 f"- {rule.key} ({rule.title_ru})",
+                f"  scope: {rule.evaluation_scope}",
+                f"  seller_window_max: {rule.seller_window_max}",
+                f"  hit_policy: {rule.hit_policy}",
                 f"  что проверяем: {rule.what_to_check}",
                 f"  зачем это бизнесу: {rule.why_it_matters}",
                 f"  reason_code: {_reason_codes_for_rule(rule.key)}",
@@ -275,10 +322,17 @@ def build_evaluator_prompts_bundle(
         [
             "",
             "Проверь доказуемость:",
-            "- если hit=true, evidence_quote обязан быть непустой дословной contiguous подстрокой seller_text;",
-            "- language evidence_quote должен совпадать с language seller_text;",
+            "- если hit=true: evidence_quote непустой, evidence_message_id/evidence_message_order обязательны;",
+            "- evidence_quote обязан быть contiguous подстрокой текста seller-сообщения по evidence_message_id;",
+            "- evidence_message_order должен совпадать с порядком этого же сообщения в seller_catalog;",
+            "- для greeting anchor должен быть в первых greeting_window_max seller-сообщениях;",
             "- перевод/перефраз/улучшение формулировки evidence_quote недопустимы;",
-            "- если hit=false, reason и reason_code все равно обязательны.",
+            "- если не можешь дать exact quote, ставь hit=false и не выдумывай цитату.",
+            "",
+            "SELF-CHECK перед JSON:",
+            "1) Найди anchor_text по evidence_message_id;",
+            "2) Проверь condition: evidence_quote in anchor_text (строго, symbol-for-symbol);",
+            "3) Если condition=false, исправь evidence_quote или поставь hit=false.",
         ]
     )
     return system_prompt, "\n".join(lines)
@@ -287,33 +341,40 @@ def build_evaluator_prompts_bundle(
 def build_judge_prompts_bundle(
     rules: Sequence[RuleCard],
     *,
-    seller_text: str,
-    customer_text: str,
+    conversation_id: str,
     chat_context: str,
+    seller_catalog: Sequence[SellerMessageRef],
     evaluator: BundledEvaluatorResult,
     context_mode: str,
+    greeting_window_max: int,
 ) -> tuple[str, str]:
-    """Формирует bundled-prompt judge: один вызов на реплику, все правила сразу."""
+    """Формирует bundled-prompt judge: один вызов на диалог, все правила сразу."""
 
     system_prompt = (
         "Ты независимый judge качества. "
-        "Для каждого правила сначала вычисли expected_hit по контексту, "
+        "Для каждого правила сначала вычисли expected_hit по контексту диалога, "
         "затем выставь label=true только если evaluator.hit совпал с expected_hit. "
+        "Учитывай greeting только в первых greeting_window_max seller-сообщениях. "
         "Верни только JSON по схеме BundledJudgeResult. "
         "rationale пиши кратко на русском."
     )
 
     lines = [
+        f"conversation_id={conversation_id}",
         f"context_mode={context_mode}",
-        f"customer_text={customer_text}",
-        f"seller_text={seller_text}",
-        "Контекст чата до текущей реплики:",
+        f"greeting_window_max={int(greeting_window_max)}",
+        "BEGIN_SELLER_CATALOG_JSON",
+        _seller_catalog_json(seller_catalog),
+        "END_SELLER_CATALOG_JSON",
+        "Контекст чата:",
         chat_context,
         "",
         "Правила для проверки:",
     ]
     for rule in rules:
-        lines.append(f"- {rule.key}: {rule.what_to_check}")
+        lines.append(
+            f"- {rule.key}: scope={rule.evaluation_scope}, hit_policy={rule.hit_policy}, seller_window_max={rule.seller_window_max}"
+        )
     lines.extend(
         [
             "",

@@ -32,16 +32,44 @@ def _reason_code(rule_key: str, hit: bool) -> str:
     return "empathy_acknowledged" if hit else "informational_without_empathy"
 
 
-def _eval_rule(rule_key: str, text: str, customer_text: str) -> tuple[bool, str]:
-    low = text.lower()
+def _eval_rule(rule_key: str, seller_rows: list[dict[str, object]]) -> tuple[bool, str, str, int | None, int | None]:
+    def is_greeting(text: str) -> bool:
+        low = text.lower()
+        return "здрав" in low or "hello" in low
+
+    def is_upsell(text: str) -> bool:
+        low = text.lower()
+        return "пакет" in low or "plan" in low or "доп" in low
+
+    def is_empathy(text: str) -> bool:
+        low = text.lower()
+        return "понима" in low or "understand" in low
+
+    matcher = {
+        "greeting": is_greeting,
+        "upsell": is_upsell,
+        "empathy": is_empathy,
+    }.get(rule_key, lambda _text: False)
+
+    greeting_window = seller_rows[:3]
     if rule_key == "greeting":
-        hit = "здрав" in low or "hello" in low
-    elif rule_key == "upsell":
-        hit = "пакет" in low or "plan" in low or "доп" in low
-    else:
-        hit = ("понима" in low or "understand" in low) and bool(customer_text.strip())
-    quote = text.split()[0] if hit and text.split() else ""
-    return hit, quote
+        for row in greeting_window:
+            text = str(row["text"])
+            if matcher(text):
+                quote = text.split()[0] if text.split() else ""
+                return True, "greeting_present", quote, int(row["message_id"]), int(row["message_order"])
+        for row in seller_rows:
+            text = str(row["text"])
+            if matcher(text):
+                return False, "greeting_late", "", None, None
+        return False, "greeting_missing", "", None, None
+
+    for row in seller_rows:
+        text = str(row["text"])
+        if matcher(text):
+            quote = text.split()[0] if text.split() else ""
+            return True, _reason_code(rule_key, True), quote, int(row["message_id"]), int(row["message_order"])
+    return False, _reason_code(rule_key, False), "", None, None
 
 
 class DocsLLM:
@@ -110,25 +138,42 @@ class DocsLLM:
             conn.commit()
 
         if model_type is BundledEvaluatorResult:
-            seller_text = str(conn.execute("SELECT text FROM messages WHERE message_id=?", (message_id,)).fetchone()[0])
-            customer_line = next((line for line in user_prompt.splitlines() if line.startswith("customer_text=")), "")
-            customer_text = customer_line.partition("=")[2]
+            rows = conn.execute(
+                """
+                SELECT message_id, message_order, text
+                FROM messages
+                WHERE conversation_id=? AND speaker_label='Sales Rep'
+                ORDER BY message_order
+                """,
+                (conversation_id,),
+            ).fetchall()
+            seller_rows = [
+                {
+                    "message_id": int(row["message_id"]),
+                    "message_order": int(row["message_order"]),
+                    "text": str(row["text"]),
+                }
+                for row in rows
+            ]
             payload = {}
             for rule_key in ("greeting", "upsell", "empathy"):
-                hit, quote = _eval_rule(rule_key, seller_text, customer_text)
+                hit, reason_code, quote, evidence_message_id, evidence_message_order = _eval_rule(rule_key, seller_rows)
                 payload[rule_key] = RuleEvaluation(
                     hit=hit,
                     confidence=0.8,
-                    reason_code=_reason_code(rule_key, hit),
+                    reason_code=reason_code,
                     reason="ok",
                     evidence_quote=quote,
+                    evidence_message_id=evidence_message_id,
+                    evidence_message_order=evidence_message_order,
                 )
             parsed = BundledEvaluatorResult(**payload)
             _persist_log(response_chars=len(parsed.model_dump_json()), extracted_payload=parsed.model_dump())
             return CallResult(parsed, True, True, "", False, False)
 
         if model_type is BundledJudgeResult:
-            evaluator_payload = _extract_json_blob(user_prompt)
+            evaluator_text = user_prompt.partition("Ответ evaluator (JSON):")[2].strip()
+            evaluator_payload = json.loads(evaluator_text) if evaluator_text else {}
             evaluator = BundledEvaluatorResult.model_validate(evaluator_payload)
             out: dict[str, RuleJudgeEvaluation] = {}
             for rule_key in ("greeting", "upsell", "empathy"):
