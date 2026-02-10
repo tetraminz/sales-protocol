@@ -36,8 +36,10 @@
 
 ## Допустимые термины и где они определены
 
-- Термины бизнес-правил и порогов: [`src/dialogs/sgr_core.py`](../src/dialogs/sgr_core.py)
+- Термины бизнес-правил, порогов и fixed scan-policy: [`src/dialogs/sgr_core.py`](../src/dialogs/sgr_core.py)
 - Техническая реализация независимого judge-слоя: [`src/dialogs/judge/`](../src/dialogs/judge/)
+- Оркестрация scan/report и слой инфраструктуры: [`src/dialogs/infrastructure/`](../src/dialogs/infrastructure/)
+- Публичные интерфейсы run/report: [`src/dialogs/interfaces/`](../src/dialogs/interfaces/)
 - Термины схемы и полей БД: [`src/dialogs/db.py`](../src/dialogs/db.py)
 - Контракт запуска и интерпретации: [`README.md`](../README.md)
 - Визуальная интерпретация для руководства: [`notebooks/sgr_quality_demo.ipynb`](../notebooks/sgr_quality_demo.ipynb)

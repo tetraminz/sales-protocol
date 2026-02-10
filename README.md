@@ -28,9 +28,11 @@
 
 ## Архитектурные Слои
 
-- `src/dialogs/sgr_core.py`: бизнес-ядро правил (`Rule`), бизнес-порогов и evaluator prompt.
+- `src/dialogs/sgr_core.py`: бизнес-ядро правил (`Rule`), бизнес-порогов, evaluator prompt и fixed scan-policy (`fixed_scan_policy()`).
 - `src/dialogs/judge/`: независимый judge-слой (schema factory, prompt builder, rule-key mapping).
-- `src/dialogs/pipeline.py`: orchestration scan/report без изменения бизнес-семантики метрик.
+- `src/dialogs/infrastructure/`: scan/report orchestration, SQL-агрегации и запись артефактов.
+- `src/dialogs/interfaces/`: тонкие публичные интерфейсы `run_scan/build_report`.
+- `src/dialogs/pipeline.py`: backward-compatible фасад для legacy-импортов.
 - `docs/judge_module.md`: практическая документация judge-слоя и checklist добавления нового Rule.
 
 ## Быстрый Запуск

@@ -5,8 +5,8 @@ import os
 
 from .db import connect, init_db
 from .ingest import ingest_csv_dir
+from .interfaces import build_report, run_scan
 from .llm import LLMClient
-from .pipeline import build_report, run_scan
 
 
 def run_demo(

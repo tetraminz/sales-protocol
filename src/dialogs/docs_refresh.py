@@ -7,10 +7,11 @@ import tempfile
 
 from .db import connect, init_db
 from .ingest import ingest_csv_dir
+from .interfaces import build_report, run_scan
 from .llm import CallResult
 from .models import RuleEvaluation, RuleJudgeEvaluation
-from .pipeline import build_report, run_scan
 from .sgr_core import all_rules
+from .sgr_core_deterministic import rule_eval_for_dialog
 from .utils import now_utc
 
 
@@ -23,54 +24,6 @@ def _extract_json_blob(text: str) -> dict[str, object]:
         return json.loads(text[start : end + 1])
     except Exception:
         return {}
-
-
-def _reason_code(rule_key: str, hit: bool) -> str:
-    if rule_key == "greeting":
-        return "greeting_present" if hit else "greeting_missing"
-    if rule_key == "upsell":
-        return "upsell_offer" if hit else "upsell_missing"
-    return "empathy_acknowledged" if hit else "informational_without_empathy"
-
-
-def _eval_rule(rule_key: str, seller_rows: list[dict[str, object]]) -> tuple[bool, str, str, int | None, int | None]:
-    def is_greeting(text: str) -> bool:
-        low = text.lower()
-        return "здрав" in low or "hello" in low
-
-    def is_upsell(text: str) -> bool:
-        low = text.lower()
-        return "пакет" in low or "plan" in low or "доп" in low
-
-    def is_empathy(text: str) -> bool:
-        low = text.lower()
-        return "понима" in low or "understand" in low
-
-    matcher = {
-        "greeting": is_greeting,
-        "upsell": is_upsell,
-        "empathy": is_empathy,
-    }.get(rule_key, lambda _text: False)
-
-    greeting_window = seller_rows[:3]
-    if rule_key == "greeting":
-        for row in greeting_window:
-            text = str(row["text"])
-            if matcher(text):
-                quote = text.split()[0] if text.split() else ""
-                return True, "greeting_present", quote, int(row["message_id"]), int(row["message_order"])
-        for row in seller_rows:
-            text = str(row["text"])
-            if matcher(text):
-                return False, "greeting_late", "", None, None
-        return False, "greeting_missing", "", None, None
-
-    for row in seller_rows:
-        text = str(row["text"])
-        if matcher(text):
-            quote = text.split()[0] if text.split() else ""
-            return True, _reason_code(rule_key, True), quote, int(row["message_id"]), int(row["message_order"])
-    return False, _reason_code(rule_key, False), "", None, None
 
 
 class DocsLLM:
@@ -161,7 +114,10 @@ class DocsLLM:
             ]
             payload: dict[str, RuleEvaluation] = {}
             for rule_key in self.rule_keys:
-                hit, reason_code, quote, evidence_message_id, evidence_message_order = _eval_rule(rule_key, seller_rows)
+                hit, reason_code, quote, evidence_message_id, evidence_message_order = rule_eval_for_dialog(
+                    rule_key,
+                    seller_rows,
+                )
                 payload[rule_key] = RuleEvaluation(
                     hit=hit,
                     confidence=0.8,

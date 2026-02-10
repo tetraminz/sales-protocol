@@ -8,6 +8,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from .sgr_core import fixed_scan_policy
 from .utils import jdump, now_utc
 
 try:  # pragma: no cover
@@ -169,8 +170,10 @@ class LLMClient:
         response_chars = len(extracted)
         latency_ms = int((time.time() - started) * 1000)
 
-        # Audit trace is always full in v3 stabilization mode.
-        trace_mode = "full"
+        policy = fixed_scan_policy()
+        trace_mode = policy.llm_trace
+        context_mode = policy.context_mode
+        judge_policy = policy.judge_mode
         stored_request = jdump(request_payload)
         stored_response = response_json
         stored_extracted = extracted
@@ -191,8 +194,8 @@ class LLMClient:
                 conversation_id,
                 int(message_id),
                 int(attempt),
-                "full",
-                "full",
+                context_mode,
+                judge_policy,
                 trace_mode,
                 int(prompt_chars),
                 int(response_chars),

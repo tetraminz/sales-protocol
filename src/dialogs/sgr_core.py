@@ -24,6 +24,9 @@ METRICS_VERSION = "v5_dialog_level_bundle"
 
 EvaluationScope = Literal["conversation"]
 HitPolicy = Literal["any_occurrence"]
+JudgeMode = Literal["full"]
+ContextMode = Literal["full"]
+TraceMode = Literal["full"]
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,24 @@ class SellerMessageRef:
     text: str
 
 
+@dataclass(frozen=True)
+class ScanPolicy:
+    """Фиксированная scan-policy v5 для интерпретируемых метрик/отчетов."""
+
+    bundle_rules: bool = True
+    judge_mode: JudgeMode = "full"
+    context_mode: ContextMode = "full"
+    llm_trace: TraceMode = "full"
+    greeting_window_max: int = 3
+
+# КАК ДОБАВИТЬ НОВОЕ RULE:
+# 1) Добавьте новую RuleCard в RULES (key/title_ru/what_to_check/why_it_matters/...).
+# 2) Добавьте reason_codes в RULE_REASON_CODES и антипаттерны в RULE_ANTI_PATTERNS.
+# 3) Проверьте тестовые фикстуры и fake-LLM в tests/ и docs_refresh (они должны брать rule_keys из all_rules()).
+# 4) Прогоните `make test && make docs` и убедитесь, что scan/report контракт остался стабильным.
+# 5) Если изменился публичный бизнес-термин, синхронно обновите doc-contract файлы из docs/stability_case_review.md.
+
+
 RULES: tuple[RuleCard, ...] = (
     RuleCard(
         key="greeting",
@@ -89,6 +110,7 @@ RULES: tuple[RuleCard, ...] = (
 )
 
 QUALITY_THRESHOLDS = QualityThresholds()
+FIXED_SCAN_POLICY = ScanPolicy()
 
 # Бизнес-правила для оценки каждого диалога.
 RULE_REASON_CODES: dict[str, tuple[ReasonCode, ...]] = {
@@ -111,13 +133,6 @@ RULE_ANTI_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# КАК ДОБАВИТЬ НОВОЕ RULE:
-# 1) Добавьте новую RuleCard в RULES (key/title_ru/what_to_check/why_it_matters/...).
-# 2) Добавьте reason_codes в RULE_REASON_CODES и антипаттерны в RULE_ANTI_PATTERNS.
-# 3) Проверьте тестовые фикстуры и fake-LLM в tests/ и docs_refresh (они должны брать rule_keys из all_rules()).
-# 4) Прогоните `make test && make docs` и убедитесь, что scan/report контракт остался стабильным.
-# 5) Если изменился публичный бизнес-термин, синхронно обновите doc-contract файлы из docs/stability_case_review.md.
-
 
 # Блок доступа к контракту правил и порогов.
 def all_rules() -> tuple[RuleCard, ...]:
@@ -136,6 +151,12 @@ def quality_thresholds() -> QualityThresholds:
     """Возвращает централизованные пороги зон качества."""
 
     return QUALITY_THRESHOLDS
+
+
+def fixed_scan_policy() -> ScanPolicy:
+    """Возвращает фиксированную продуктовую scan-policy v5."""
+
+    return FIXED_SCAN_POLICY
 
 
 def heatmap_zone(score: float | None, *, thresholds: QualityThresholds | None = None) -> str:
@@ -224,7 +245,13 @@ def build_chat_context(
         order = int(item["message_order"])  # type: ignore[index]
         speaker = str(item["speaker_label"])  # type: ignore[index]
         text = str(item["text"])  # type: ignore[index]
-        lines.append(f"[{order}] {speaker}: {text}")
+        if is_seller_message(speaker):
+            role = "S"
+        elif is_customer_message(speaker):
+            role = "C"
+        else:
+            role = speaker
+        lines.append(f"[{order}]{role}: {text}")
     return "\n".join(lines)
 
 
@@ -232,13 +259,6 @@ def build_chat_context(
 def _reason_codes_for_rule(rule_key: str) -> str:
     values = RULE_REASON_CODES.get(rule_key, ())
     return ", ".join(f"`{value}`" for value in values)
-
-
-def _anti_patterns_for_rule(rule_key: str) -> str:
-    values = RULE_ANTI_PATTERNS.get(rule_key, ())
-    if not values:
-        return ""
-    return "\n".join(f"- {item}" for item in values)
 
 
 def build_rule_business_context(rules: Sequence[RuleCard]) -> list[dict[str, object]]:
@@ -261,11 +281,11 @@ def build_rule_business_context(rules: Sequence[RuleCard]) -> list[dict[str, obj
 
 
 def _seller_catalog_json(seller_catalog: Sequence[SellerMessageRef]) -> str:
+    # Для evaluator здесь нужен только индекс anchor-сообщений (без дублирования текста).
     payload = [
         {
             "message_id": int(item.message_id),
             "message_order": int(item.message_order),
-            "text": str(item.text),
         }
         for item in seller_catalog
     ]
@@ -278,12 +298,51 @@ def _seller_catalog_copy_blocks(seller_catalog: Sequence[SellerMessageRef]) -> s
         lines.extend(
             [
                 f"ANCHOR message_id={int(item.message_id)} message_order={int(item.message_order)}",
-                "BEGIN_ANCHOR_TEXT",
                 str(item.text),
-                "END_ANCHOR_TEXT",
             ]
         )
     return "\n".join(lines)
+
+
+def _rule_prompt_lines(rule: RuleCard) -> list[str]:
+    lines = [
+        f"- {rule.key} ({rule.title_ru}): {rule.what_to_check}",
+        f"  reason_code: {_reason_codes_for_rule(rule.key)}",
+    ]
+    anti = RULE_ANTI_PATTERNS.get(rule.key, ())
+    if anti:
+        lines.append(f"  антипаттерны: {'; '.join(str(item) for item in anti)}")
+    return lines
+
+
+# Эти маркеры уже используются в тестах и в ручном аудите llm_calls, поэтому не переименовываем их.
+SELLER_CATALOG_BEGIN = "BEGIN_SELLER_CATALOG_JSON"
+SELLER_CATALOG_END = "END_SELLER_CATALOG_JSON"
+SELLER_ANCHORS_BEGIN = "BEGIN_SELLER_ANCHOR_BLOCKS"
+SELLER_ANCHORS_END = "END_SELLER_ANCHOR_BLOCKS"
+
+EVALUATOR_SYSTEM_PROMPT = (
+    "Ты evaluator качества продаж. "
+    "Верни только JSON по bundled evaluator schema. "
+    "reason пиши на русском. Строго соблюдай quote-contract."
+)
+
+# Quote-contract держим в user prompt рядом с anchor-блоками, чтобы уменьшить риск перефраза цитат.
+EVIDENCE_CONTRACT_LINES = (
+    "Quote-contract (обязательно):",
+    "- hit=true: evidence_quote непустой; evidence_message_id/evidence_message_order обязательны.",
+    "- evidence_quote = дословная contiguous подстрока anchor seller-сообщения.",
+    "- evidence_message_order должен совпадать с seller_catalog для того же message_id.",
+    "- greeting: anchor только в первых greeting_window_max seller-сообщениях.",
+    "- hit=false: evidence_quote может быть пустым; anchor-поля = null.",
+    "- Нельзя переводить, перефразировать, нормализовать или сокращать цитату.",
+)
+
+SELF_CHECK_LINES = (
+    "SELF-CHECK перед JSON:",
+    "1) Проверь strict condition: evidence_quote in anchor_text.",
+    "2) Если условие ложно: hit=false, evidence_quote='', anchor-поля=null.",
+)
 
 
 # Блок сборки prompt-ов evaluator/judge.
@@ -298,67 +357,23 @@ def build_evaluator_prompts_bundle(
 ) -> tuple[str, str]:
     """Формирует bundled-prompt evaluator: один вызов на диалог, все правила сразу."""
 
-    system_prompt = (
-        "Ты evaluator качества продаж. "
-        "Верни только JSON по bundled evaluator schema. "
-        "Оцени каждое правило из блока 'Правила для оценки' отдельно на уровне всего диалога. "
-        "reason пиши на русском. "
-        "Quote-contract обязателен: для hit=true evidence_quote должен быть дословной непустой "
-        "contiguous подстрокой anchor seller-сообщения, символ-в-символ и на том же языке. "
-        "Anchor задается полями evidence_message_id и evidence_message_order. "
-        "При hit=false evidence_quote может быть пустым, а anchor-поля должны быть null. "
-        "Запрещено изменять регистр, пунктуацию, кавычки, апострофы, диакритику и пробелы внутри evidence_quote. "
-        "Запрещено сокращать цитату многоточием, пересказывать, переводить или нормализовать символы."
-    )
-
     lines = [
         f"conversation_id={conversation_id}",
         f"context_mode={context_mode}",
         f"greeting_window_max={int(greeting_window_max)}",
-        "BEGIN_SELLER_CATALOG_JSON",
+        SELLER_CATALOG_BEGIN,
         _seller_catalog_json(seller_catalog),
-        "END_SELLER_CATALOG_JSON",
-        "Каталог anchor-сообщений для точного COPY-PASTE:",
-        "BEGIN_SELLER_ANCHOR_BLOCKS",
+        SELLER_CATALOG_END,
+        SELLER_ANCHORS_BEGIN,
         _seller_catalog_copy_blocks(seller_catalog),
-        "END_SELLER_ANCHOR_BLOCKS",
+        SELLER_ANCHORS_END,
         "Контекст чата:",
         chat_context,
         "",
         "Правила для оценки:",
     ]
     for rule in rules:
-        lines.extend(
-            [
-                f"- {rule.key} ({rule.title_ru})",
-                f"  scope: {rule.evaluation_scope}",
-                f"  seller_window_max: {rule.seller_window_max}",
-                f"  hit_policy: {rule.hit_policy}",
-                f"  что проверяем: {rule.what_to_check}",
-                f"  зачем это бизнесу: {rule.why_it_matters}",
-                f"  reason_code: {_reason_codes_for_rule(rule.key)}",
-            ]
-        )
-        anti = _anti_patterns_for_rule(rule.key)
-        if anti:
-            lines.append("  антипаттерны:")
-            for item in anti.splitlines():
-                lines.append(f"  {item}")
-    lines.extend(
-        [
-            "",
-            "Проверь доказуемость:",
-            "- если hit=true: evidence_quote непустой, evidence_message_id/evidence_message_order обязательны;",
-            "- evidence_quote обязан быть contiguous подстрокой текста seller-сообщения по evidence_message_id;",
-            "- evidence_message_order должен совпадать с порядком этого же сообщения в seller_catalog;",
-            "- для greeting anchor должен быть в первых greeting_window_max seller-сообщениях;",
-            "- перевод/перефраз/улучшение формулировки evidence_quote недопустимы;",
-            "- если не можешь дать exact quote, ставь hit=false и не выдумывай цитату.",
-            "",
-            "SELF-CHECK перед JSON:",
-            "1) Найди anchor_text по evidence_message_id;",
-            "2) Проверь condition: evidence_quote in anchor_text (строго, symbol-for-symbol);",
-            "3) Если condition=false, исправь evidence_quote или поставь hit=false.",
-        ]
-    )
-    return system_prompt, "\n".join(lines)
+        lines.extend(_rule_prompt_lines(rule))
+
+    lines.extend(["", *EVIDENCE_CONTRACT_LINES, "", *SELF_CHECK_LINES])
+    return EVALUATOR_SYSTEM_PROMPT, "\n".join(lines)
